@@ -14,13 +14,25 @@ class HTModel(pl.LightningModule):
         self.linear = nn.Sequential(nn.Linear(self.hubert.config.hidden_size, 1))
 
         self.f1_val = torchmetrics.F1Score(task="binary")
+        self.f1_test = torchmetrics.F1Score(task="binary")
+        self.accuracy_test = torchmetrics.Accuracy(task="binary")
 
         self.trainable_layers = trainable_layers
+        
+        # Freeze all HuBERT layers initially
+        for param in self.hubert.parameters():
+            param.requires_grad = False
+        
+        # Unfreeze the last N encoder layers for fine-tuning
+        total_layers = len(self.hubert.encoder.layers)
+        for t in range(1, self.trainable_layers + 1):
+            if t <= total_layers:
+                for param in self.hubert.encoder.layers[-t].parameters():
+                    param.requires_grad = True
 
     def forward(self, wav: Tensor, mask: Tensor) -> Tensor:
         """
         The model's forward pass
-
         Parameters
         ----------
         input_values : Tensor
@@ -40,9 +52,6 @@ class HTModel(pl.LightningModule):
     def training_step(self, batch: tuple[Tensor, Tensor, Tensor], batch_idx: int):
         wav, mask, trustworthy = batch
         batch_size = wav.shape[0]
-
-        for t in range(1, self.trainable_layers + 1):
-            self.hubert.encoder.layers[-t].train()
 
         y_pred = self(wav=wav, mask=mask)
         loss = F.binary_cross_entropy_with_logits(input=y_pred, target=trustworthy)
@@ -93,9 +102,28 @@ class HTModel(pl.LightningModule):
         y_pred = self(wav=wav, mask=mask)
         loss = F.binary_cross_entropy_with_logits(input=y_pred, target=trustworthy)
 
+        self.f1_test(y_pred, trustworthy)
+        self.accuracy_test(y_pred, trustworthy)
+
         self.log(
             "test_loss",
             loss,
+            on_epoch=True,
+            on_step=False,
+            sync_dist=True,
+            batch_size=batch_size,
+        )
+        self.log(
+            "test_f1",
+            self.f1_test,
+            on_epoch=True,
+            on_step=False,
+            sync_dist=True,
+            batch_size=batch_size,
+        )
+        self.log(
+            "test_accuracy",
+            self.accuracy_test,
             on_epoch=True,
             on_step=False,
             sync_dist=True,
