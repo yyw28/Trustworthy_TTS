@@ -7,6 +7,12 @@ lightning_logs/
 *.ipynb
 *.csv
 
+# Large checkpoint files
+src/tspeech/model/UNIVERSAL_V1/*.ckpt
+src/tspeech/model/UNIVERSAL_V1/g_*
+src/tspeech/model/UNIVERSAL_V1/do_*
+*.ckpt
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
