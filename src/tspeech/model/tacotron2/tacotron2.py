@@ -22,6 +22,7 @@ class Tacotron2(nn.Module):
         dropout: float,
         speaker_tokens_enabled: bool,
         speaker_count: Optional[int],
+        extra_encoded_dim: int = 0,
     ):
         super().__init__()
 
@@ -29,7 +30,10 @@ class Tacotron2(nn.Module):
         self.num_mels = num_mels
         self.att_rnn_dim = att_rnn_dim
         self.rnn_hidden_dim = rnn_hidden_dim
-        self.char_embedding_dim = encoded_dim
+
+        speaker_token_dim = encoded_dim
+
+        self.encoded_full_dim: int = encoded_dim + extra_encoded_dim
 
         self.speaker_embeddings_enabled: Final[bool] = speaker_tokens_enabled
         if speaker_tokens_enabled:
@@ -43,8 +47,9 @@ class Tacotron2(nn.Module):
             print("Speaker tokens disabled")
 
         if speaker_tokens_enabled and speaker_count is not None:
+            self.encoded_full_dim += speaker_token_dim // 2
             self.speaker_embedding = nn.Embedding(
-                num_embeddings=speaker_count, embedding_dim=encoded_dim
+                num_embeddings=speaker_count, embedding_dim=speaker_token_dim // 2
             )
             self.speaker_embedding.weight.data.normal_(mean=0, std=0.5)
 
@@ -68,7 +73,6 @@ class Tacotron2(nn.Module):
             AlwaysDropout(dropout),
         )
 
-        self.encoded_full_dim = self.embedding_dim
         self.att_encoder = nn.Linear(self.encoded_full_dim, att_dim, bias=False)
 
         # Tacotron 2 decoder
@@ -121,6 +125,7 @@ class Tacotron2(nn.Module):
         chars_idx: Tensor,
         chars_idx_len: Tensor,
         teacher_forcing: bool,
+        teacher_forcing_dropout: float,
         mel_spectrogram: Optional[Tensor] = None,
         mel_spectrogram_len: Optional[Tensor] = None,
         speaker_id: Optional[Tensor] = None,
@@ -145,10 +150,18 @@ class Tacotron2(nn.Module):
 
         # Encoding --------------------------------------------------------------------------------
         encoded = self.encoder(chars_idx, chars_idx_len)
+        encoded_extra_arr = []
         if self.speaker_embeddings_enabled:
-            encoded = encoded + self.speaker_embedding(speaker_id).unsqueeze(1)
+            encoded_extra_arr.append(
+                torch.tanh(self.speaker_embedding(speaker_id))
+                .unsqueeze(1)
+                .expand((-1, encoded.shape[1], -1)),
+            )
         if encoded_extra is not None:
-            encoded = encoded + encoded_extra
+            encoded_extra_arr.append(encoded_extra.expand((-1, encoded.shape[1], -1)))
+
+        if len(encoded_extra_arr) > 0:
+            encoded = torch.concat([encoded] + encoded_extra_arr, -1)
 
         # Create a mask for the encoded characters
         encoded_mask = (
@@ -244,6 +257,11 @@ class Tacotron2(nn.Module):
             # Prepare for the next iteration
             if teacher_forcing:
                 prev_mel = decoder_in[i + 1]
+                if teacher_forcing_dropout > 0.0:
+                    prev_mel = prev_mel * (
+                        torch.rand(batch_size, device=device)
+                        < (1 - teacher_forcing_dropout)
+                    ).unsqueeze(1)
             else:
                 done[gate_out.squeeze(-1) < 0.0] = True
                 lengths[gate_out.squeeze(-1) >= 0.0] += 1

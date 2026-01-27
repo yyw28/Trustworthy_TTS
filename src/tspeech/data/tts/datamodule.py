@@ -93,36 +93,27 @@ class TTSDatamodule(LightningDataModule):
         self.sample_rate: Final[int] = sample_rate
 
     def setup(self, stage: str):
-        self._train_dataloader = DataLoader(
-            self.__load_dataset(self.csv_train),
-            batch_size=self.batch_size,
-            collate_fn=collate_fn,
-            shuffle=True,
-            drop_last=True,
-            pin_memory=True,
-            num_workers=self.num_workers,
-            persistent_workers=True,
-        )
-        self._val_dataloader = DataLoader(
-            self.__load_dataset(self.csv_val),
-            batch_size=self.batch_size,
-            collate_fn=collate_fn,
-            shuffle=False,
-            drop_last=False,
-            pin_memory=True,
-            num_workers=self.num_workers,
-            persistent_workers=True,
-        )
-        self._test_dataloader = DataLoader(
-            self.__load_dataset(self.csv_test),
-            batch_size=self.batch_size,
-            collate_fn=collate_fn,
-            shuffle=False,
-            drop_last=False,
-            pin_memory=True,
-            num_workers=self.num_workers,
-            persistent_workers=True,
-        )
+        if stage == "fit":
+            self._train_dataloader = DataLoader(
+                self.__load_dataset(self.csv_train),
+                batch_size=self.batch_size,
+                collate_fn=collate_fn,
+                shuffle=True,
+                drop_last=True,
+                pin_memory=True,
+                num_workers=self.num_workers,
+                persistent_workers=True,
+            )
+            self._val_dataloader = DataLoader(
+                self.__load_dataset(self.csv_val),
+                batch_size=self.batch_size * 4,
+                collate_fn=collate_fn,
+                shuffle=False,
+                drop_last=False,
+                pin_memory=True,
+                num_workers=self.num_workers,
+                persistent_workers=True,
+            )
 
     def __load_dataset(self, filename: str) -> TTSDataset:
         df = pd.read_csv(

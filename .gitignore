@@ -1,10 +1,12 @@
+nohup.out
+UNIVERSAL_V1
+CXD
 datasets/
 .vscode
 .DS_Store/
 
 # Custom ML project exclusions
 lightning_logs/
-*.ipynb
 *.csv
 
 # Byte-compiled / optimized / DLL files

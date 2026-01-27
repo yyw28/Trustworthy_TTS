@@ -1,7 +1,7 @@
 {
     "data": {
         "allowed_chars": "!'(),.:;? \\-abcdefghijklmnopqrstuvwxyz",
-        "batch_size": 24,
+        "batch_size": 32,
         "csv_test": "libritts-test.csv",
         "csv_train": "libritts-train.csv",
         "csv_val": "libritts-val.csv",
@@ -9,7 +9,7 @@
         "expand_abbreviations": true,
         "num_mels": 80,
         "num_workers": 4,
-        "sample_rate": 24000,
+        "sample_rate": 16000,
         "silence": 512,
         "trim": true,
         "trim_frame_length": 1024,
@@ -21,18 +21,20 @@
         "dropout": 0.5,
         "encoded_dim": 512,
         "encoder_kernel_size": 5,
-        "num_chars": 39,
+        "gst_enabled": true,
+        "num_chars": 65,
         "num_mels": 80,
         "postnet_dim": 512,
         "prenet_dim": 256,
         "rnn_hidden_dim": 1024,
         "speaker_count": 928,
-        "speaker_tokens_enabled": true
+        "speaker_tokens_enabled": true,
+        "teacher_forcing_dropout": 0.5
     },
     "optimizer": {
         "class_path": "Adam",
         "init_args": {
-            "lr": 1e-4,
+            "lr": 1e-3,
             "weight_decay": 1e-6
         }
     },
@@ -68,7 +70,7 @@
             "class_path": "lightning.pytorch.loggers.TensorBoardLogger",
             "init_args": {
                 "default_hp_metric": false,
-                "name": "tacotron2",
+                "name": "tacotron2-revised-code",
                 "save_dir": "lightning_logs"
             }
         },

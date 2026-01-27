@@ -1,18 +1,15 @@
-import os
-import random
 import re
 from os import path
-from typing import Any, Optional, NamedTuple
+from typing import NamedTuple, Optional
 
 import librosa
 import torch
-import torchaudio
-import unidecode
 from sklearn.preprocessing import OrdinalEncoder
 from torch import Tensor
 from torch.nn import functional as F
 from torch.utils.data import Dataset
 from torchaudio.transforms import MelSpectrogram
+from torchcodec.decoders import AudioDecoder
 
 
 class TTSBatch(NamedTuple):
@@ -84,6 +81,8 @@ class TTSDataset(Dataset):
         if end_token is not None and end_token in allowed_chars:
             raise Exception("end_token cannot be in allowed_chars!")
 
+        self.sample_rate = sample_rate
+
         # Simple assignments
         self.filenames = filenames
         self.end_token = end_token
@@ -111,16 +110,22 @@ class TTSDataset(Dataset):
         print(f"Dataset: Allowed characters {allowed_chars}")
 
         # Preprocessing step - ensure textual data only contains allowed characters
-        allowed_chars_re = re.compile(f"[^{allowed_chars}]+")
-        texts = [
-            allowed_chars_re.sub("", unidecode.unidecode(t).lower()) for t in texts
-        ]
+        # allowed_chars_re = re.compile(f"[^{allowed_chars}]+")
+        # texts = [
+        #     allowed_chars_re.sub("", unidecode.unidecode(t).lower()) for t in texts
+        # ]
 
         if expand_abbreviations:
             print("Dataset: Expanding abbreviations in input text...")
             texts = [_expand_abbreviations(t) for t in texts]
         if end_token is not None:
             texts = [t + end_token for t in texts]
+
+        chars_set = set()
+        for t in texts:
+            chars_set = chars_set.union(set(t))
+        chars = list(chars_set)
+        chars.sort()
 
         self.texts = texts
 
@@ -130,9 +135,9 @@ class TTSDataset(Dataset):
         # tensor of integers
         self.encoder = OrdinalEncoder()
         if end_token is None:
-            self.encoder.fit([[x] for x in list(allowed_chars)])
+            self.encoder.fit([[x] for x in chars])
         else:
-            self.encoder.fit([[x] for x in list(allowed_chars) + [end_token]])
+            self.encoder.fit([[x] for x in chars + [end_token]])
 
         # Create a Torchaudio MelSpectrogram generator
         self.melspectrogram = MelSpectrogram(
@@ -157,7 +162,9 @@ class TTSDataset(Dataset):
         # Load the audio file and squeeze it to a 1D Tensor
         filename = self.filenames[i]
 
-        wav, _ = torchaudio.load(path.join(self.base_dir, filename))
+        with open(path.join(self.base_dir, filename), "rb") as infile:
+            decoder = AudioDecoder(infile.read(), sample_rate=self.sample_rate)
+            wav = decoder.get_all_samples().data
         wav = wav.squeeze(0)
 
         # Trim if necessary

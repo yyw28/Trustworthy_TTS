@@ -82,13 +82,20 @@ class STL(nn.Module):
         )
         d_q = ref_enc_gru_size
         d_k = token_embedding_size // num_heads
-        self.attention = MultiHeadAttention(
-            query_dim=d_q,
-            key_dim=d_k,
-            num_units=token_embedding_size,
-            num_heads=num_heads,
+
+        self.W_query = nn.Linear(
+            in_features=d_q, out_features=token_embedding_size, bias=False
         )
 
+        self.attention = nn.MultiheadAttention(
+            token_embedding_size,
+            num_heads=num_heads,
+            kdim=d_k,
+            vdim=d_k,
+            batch_first=True,
+        )
+
+        # REVISED CODE - std was 0.25 (this was not original - 0.5 is in the original implementation)
         nn.init.normal_(self.embed, mean=0, std=0.5)
 
     def forward(self, inputs):
@@ -97,66 +104,19 @@ class STL(nn.Module):
         keys = (
             torch.tanh(self.embed).unsqueeze(0).expand(N, -1, -1)
         )  # [N, token_num, token_embedding_size // num_heads]
-        style_embed = self.attention(query=query, key=keys)
+        style_embed, _ = self.attention(
+            query=self.W_query(query),
+            key=keys,
+            value=keys,
+            need_weights=False,
+            average_attn_weights=False,
+        )
 
         return style_embed
 
 
-class MultiHeadAttention(nn.Module):
-    """
-    input:
-        query --- [N, T_q, query_dim]
-        key --- [N, T_k, key_dim]
-    output:
-        out --- [N, T_q, num_units]
-    """
-
-    def __init__(self, query_dim, key_dim, num_units, num_heads):
-        super().__init__()
-        self.num_units = num_units
-        self.num_heads = num_heads
-        self.key_dim = key_dim
-
-        self.W_query = nn.Linear(
-            in_features=query_dim, out_features=num_units, bias=False
-        )
-        self.W_key = nn.Linear(in_features=key_dim, out_features=num_units, bias=False)
-        self.W_value = nn.Linear(
-            in_features=key_dim, out_features=num_units, bias=False
-        )
-
-    def forward(self, query, key):
-        querys = self.W_query(query)  # [N, T_q, num_units]
-        keys = self.W_key(key)  # [N, T_k, num_units]
-        values = self.W_value(key)
-
-        split_size = self.num_units // self.num_heads
-        querys = torch.stack(
-            torch.split(querys, split_size, dim=2), dim=0
-        )  # [h, N, T_q, num_units/h]
-        keys = torch.stack(
-            torch.split(keys, split_size, dim=2), dim=0
-        )  # [h, N, T_k, num_units/h]
-        values = torch.stack(
-            torch.split(values, split_size, dim=2), dim=0
-        )  # [h, N, T_k, num_units/h]
-
-        # score = softmax(QK^T / (d_k ** 0.5))
-        scores = torch.matmul(querys, keys.transpose(2, 3))  # [h, N, T_q, T_k]
-        scores = scores / (self.key_dim**0.5)
-        scores = F.softmax(scores, dim=3)
-
-        # out = score * V
-        out = torch.matmul(scores, values)  # [h, N, T_q, num_units/h]
-        out = torch.cat(torch.split(out, 1, dim=0), dim=3).squeeze(
-            0
-        )  # [N, T_q, num_units]
-
-        return out
-
-
 class GST(nn.Module):
-    def __init__(self, out_dim=int):
+    def __init__(self, out_dim:int):
         super().__init__()
         self.reference_encoder = ReferenceEncoder(
             ref_enc_filters=[32, 32, 64, 64, 128, 128],
