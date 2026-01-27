@@ -1,8 +1,12 @@
-from typing import List, Optional
+import matplotlib
+
+matplotlib.use("Agg")
+
+from typing import Optional, Final
 
 import lightning as pl
 import matplotlib
-import numpy as np
+from torch import nn
 import torch
 from matplotlib.figure import Figure
 from matplotlib import pyplot as plt
@@ -27,9 +31,11 @@ class TTSModel(pl.LightningModule):
         rnn_hidden_dim: int,
         postnet_dim: int,
         dropout: float,
-        speaker_tokens_enabled: bool = False,
+        gst_enabled: bool,
+        speaker_tokens_enabled: bool,
         speaker_count: int = 1,
         max_len_override: Optional[int] = None,
+        teacher_forcing_dropout: float = 0.0,
     ):
         super().__init__()
 
@@ -37,6 +43,15 @@ class TTSModel(pl.LightningModule):
 
         self.speaker_tokens = speaker_tokens_enabled
         self.max_len_override = max_len_override
+
+        self.teacher_forcing_dropout = teacher_forcing_dropout
+
+        extra_encoded_dim = 0
+        self.gst: nn.Module | None = None
+        self.gst_enabled: Final[bool] = gst_enabled
+        if self.gst_enabled:
+            extra_encoded_dim += encoded_dim // 2
+            self.gst = GST(out_dim=encoded_dim // 2)
 
         self.tacotron2 = Tacotron2(
             num_chars=num_chars,
@@ -51,26 +66,32 @@ class TTSModel(pl.LightningModule):
             dropout=dropout,
             speaker_tokens_enabled=speaker_tokens_enabled,
             speaker_count=speaker_count,
+            extra_encoded_dim=extra_encoded_dim,
         )
-
-        self.gst = GST(out_dim=encoded_dim)
 
     def forward(
         self,
         chars_idx: Tensor,
         chars_idx_len: Tensor,
+        teacher_forcing_dropout: float,
         teacher_forcing: bool = True,
         mel_spectrogram: Optional[Tensor] = None,
         mel_spectrogram_len: Optional[Tensor] = None,
         speaker_id: Optional[Tensor] = None,
         max_len_override: Optional[int] = None,
+        mel_spectrogram_style: Optional[Tensor] = None,
+        mel_spectrogram_style_len: Optional[Tensor] = None,
     ):
-        style = self.gst(mel_spectrogram, mel_spectrogram_len)
+        style: Tensor | None = None
+
+        if self.gst is not None:
+            style = self.gst(mel_spectrogram_style, mel_spectrogram_style_len)
 
         return self.tacotron2(
             chars_idx=chars_idx,
             chars_idx_len=chars_idx_len,
             teacher_forcing=teacher_forcing,
+            teacher_forcing_dropout=teacher_forcing_dropout,
             mel_spectrogram=mel_spectrogram,
             mel_spectrogram_len=mel_spectrogram_len,
             speaker_id=speaker_id,
@@ -83,9 +104,12 @@ class TTSModel(pl.LightningModule):
             chars_idx=batch.chars_idx,
             chars_idx_len=batch.chars_idx_len,
             teacher_forcing=True,
+            teacher_forcing_dropout=0.0,
             speaker_id=batch.speaker_id,
             mel_spectrogram=batch.mel_spectrogram,
             mel_spectrogram_len=batch.mel_spectrogram_len,
+            mel_spectrogram_style=batch.mel_spectrogram,
+            mel_spectrogram_style_len=batch.mel_spectrogram_len,
         )
 
         gate_loss = F.binary_cross_entropy_with_logits(gate, batch.gate)
@@ -93,7 +117,14 @@ class TTSModel(pl.LightningModule):
         mel_post_loss = F.mse_loss(mel_spectrogram_post, batch.mel_spectrogram)
 
         loss = gate_loss + mel_loss + mel_post_loss
-        self.log("val_mel_loss", loss, on_step=False, on_epoch=True)
+        self.log(
+            "val_mel_loss",
+            loss,
+            on_step=False,
+            on_epoch=True,
+            sync_dist=True,
+            batch_size=mel_spectrogram.shape[0],
+        )
 
         mel_spectrogram_len = batch.mel_spectrogram_len
         chars_idx_len = batch.chars_idx_len
@@ -109,7 +140,14 @@ class TTSModel(pl.LightningModule):
             "gate_pred": gate[0],
         }
 
-        self.log("val_loss", loss, on_step=False, on_epoch=True)
+        self.log(
+            "val_loss",
+            loss,
+            on_step=False,
+            on_epoch=True,
+            sync_dist=True,
+            batch_size=mel_spectrogram.shape[0],
+        )
 
         out["loss"] = loss
         return out
@@ -119,9 +157,12 @@ class TTSModel(pl.LightningModule):
             chars_idx=batch.chars_idx,
             chars_idx_len=batch.chars_idx_len,
             teacher_forcing=True,
+            teacher_forcing_dropout=self.teacher_forcing_dropout,
             speaker_id=batch.speaker_id,
             mel_spectrogram=batch.mel_spectrogram,
             mel_spectrogram_len=batch.mel_spectrogram_len,
+            mel_spectrogram_style=batch.mel_spectrogram,
+            mel_spectrogram_style_len=batch.mel_spectrogram_len,
         )
 
         gate_loss = F.binary_cross_entropy_with_logits(gate, batch.gate)
@@ -135,19 +176,32 @@ class TTSModel(pl.LightningModule):
             gate_loss.detach(),
             on_step=True,
             on_epoch=True,
+            sync_dist=True,
+            batch_size=mel_spectrogram.shape[0],
         )
-        self.log("training_mel_loss", mel_loss.detach(), on_step=True, on_epoch=True)
+        self.log(
+            "training_mel_loss",
+            mel_loss.detach(),
+            on_step=True,
+            on_epoch=True,
+            sync_dist=True,
+            batch_size=mel_spectrogram.shape[0],
+        )
         self.log(
             "training_mel_post_loss",
             mel_post_loss.detach(),
             on_step=True,
             on_epoch=True,
+            sync_dist=True,
+            batch_size=mel_spectrogram.shape[0],
         )
         self.log(
             "training_loss",
             loss.detach(),
             on_step=True,
             on_epoch=True,
+            sync_dist=True,
+            batch_size=mel_spectrogram.shape[0],
         )
 
         return loss
@@ -161,6 +215,7 @@ class TTSModel(pl.LightningModule):
                 "val_mel_spectrogram",
                 plot_spectrogram_to_numpy(outputs["mel_spectrogram"].cpu().T.numpy()),
                 self.global_step,
+                close=True,
             )
             self.logger.experiment.add_figure(
                 "val_mel_spectrogram_predicted",
@@ -168,6 +223,7 @@ class TTSModel(pl.LightningModule):
                     outputs["mel_spectrogram_pred"].cpu().swapaxes(0, 1).numpy()
                 ),
                 self.global_step,
+                close=True,
             )
             self.logger.experiment.add_figure(
                 "val_alignment",
@@ -175,6 +231,7 @@ class TTSModel(pl.LightningModule):
                     outputs["alignment"].cpu().swapaxes(0, 1).numpy()
                 ),
                 self.global_step,
+                close=True,
             )
             self.logger.experiment.add_figure(
                 "val_gate",
@@ -183,6 +240,7 @@ class TTSModel(pl.LightningModule):
                     torch.sigmoid(outputs["gate_pred"]).squeeze().cpu().numpy(),
                 ),
                 self.global_step,
+                close=True,
             )
 
     def predict_step(self, batch, batch_idx, dataloader_idx=None):
@@ -196,6 +254,8 @@ class TTSModel(pl.LightningModule):
             mel_spectrogram=batch.mel_spectrogram,
             mel_spectrogram_len=batch.mel_spectrogram_len,
             max_len_override=self.max_len_override,
+            mel_spectrogram_style=batch.mel_spectrogram,
+            mel_spectrogram_style_len=batch.mel_spectrogram_len,
         )
 
         return mel_spectrogram, mel_spectrogram_post, gate, alignment, text
