@@ -7,7 +7,6 @@ datasets/
 
 # Custom ML project exclusions
 lightning_logs/
-*.ipynb
 *.csv
 
 # Byte-compiled / optimized / DLL files
