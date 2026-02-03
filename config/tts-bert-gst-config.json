@@ -1,0 +1,75 @@
+{
+  "model": {
+    "class_path": "tspeech.model.tts.TTSModel",
+    "init_args": {
+      "num_chars": 100,
+      "encoded_dim": 512,
+      "encoder_kernel_size": 5,
+      "num_mels": 80,
+      "prenet_dim": 256,
+      "att_rnn_dim": 1024,
+      "att_dim": 128,
+      "rnn_hidden_dim": 1024,
+      "postnet_dim": 512,
+      "dropout": 0.5,
+      "speaker_tokens_enabled": false,
+      "speaker_count": 1,
+      "use_bert_gst": true,
+      "bert_model_name": "bert-base-uncased",
+      "freeze_bert": true,
+      "use_hubert_classifier": false,
+      "use_rl_training": false,
+      "rl_temperature": 1.0,
+      "rl_entropy_coef": 0.01
+    }
+  },
+  "data": {
+    "class_path": "tspeech.data.tts.TTSDatamodule",
+    "init_args": {
+      "dataset_dir": "/path/to/your/tts/dataset",
+      "train_csv": "train.csv",
+      "val_csv": "val.csv",
+      "batch_size": 16,
+      "num_workers": 4
+    }
+  },
+  "trainer": {
+    "accelerator": "gpu",
+    "devices": 1,
+    "precision": "16-mixed",
+    "max_epochs": 100,
+    "logger": {
+      "class_path": "lightning.pytorch.loggers.TensorBoardLogger",
+      "init_args": {
+        "name": "tts-bert-gst",
+        "save_dir": "lightning_logs"
+      }
+    },
+    "callbacks": [
+      {
+        "class_path": "lightning.pytorch.callbacks.EarlyStopping",
+        "init_args": {
+          "mode": "min",
+          "monitor": "val_loss",
+          "patience": 10
+        }
+      },
+      {
+        "class_path": "lightning.pytorch.callbacks.ModelCheckpoint",
+        "init_args": {
+          "filename": "best-{epoch}-{val_loss:.5f}",
+          "mode": "min",
+          "monitor": "val_loss",
+          "save_top_k": 1
+        }
+      }
+    ]
+  }
+}
+
+
+
+
+
+
+
