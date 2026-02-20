@@ -499,11 +499,11 @@ class TTSModel(pl.LightningModule):
 
         device = waveforms.device
         # Detach waveforms to prevent gradients flowing through HuBERT
-        waveforms = waveforms.detach().to(device)
+        waveforms = waveforms.detach()
         lengths = torch.full((waveforms.shape[0],), waveforms.shape[1], device=device, dtype=torch.long)
         gen_logits, gen_scores = self._hubert_logits_and_scores(waveforms, lengths, sample_rate, device)
 
-        ref_waveforms = ref_waveforms.to(device)
+        ref_waveforms = ref_waveforms
         ref_lengths = torch.full((ref_waveforms.shape[0],), ref_waveforms.shape[1], device=device, dtype=torch.long)
         _, ref_scores = self._hubert_logits_and_scores(ref_waveforms, ref_lengths, 22050, device)
 
