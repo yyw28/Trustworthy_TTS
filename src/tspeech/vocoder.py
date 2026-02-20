@@ -21,14 +21,13 @@ class HiFiGANVocoder:
     HiFi-GAN vocoder wrapper for converting mel spectrograms to waveforms.
     
     Usage:
-        vocoder = HiFiGANVocoder(checkpoint_dir="UNIVERSAL_V1", sample_rate=22050)
-        waveform = vocoder(mel_spectrogram)  # (batch, mel_frames, n_mels) -> (batch, samples)
+        vocoder = HiFiGANVocoder(checkpoint_dir="UNIVERSAL_V1")
+        waveform = vocoder(mel_spectrogram)  # (batch, mel_frames, n_mels) -> (batch, samples) at 22050 Hz
     """
     
     def __init__(
         self,
         checkpoint_dir: str,
-        sample_rate: int = 22050,
         device: Optional[str] = None,
     ):
         """
@@ -38,13 +37,10 @@ class HiFiGANVocoder:
         ----------
         checkpoint_dir : str
             Directory containing config.json and generator checkpoint (e.g., g_02500000)
-        sample_rate : int
-            Target sample rate (default: 22050)
         device : Optional[str]
             Device to run on (cuda, mps, cpu). If None, auto-detects.
         """
         self.checkpoint_dir = self._resolve_checkpoint_dir(checkpoint_dir)
-        self.sample_rate = sample_rate
         
         if device is None:
             device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
@@ -90,7 +86,6 @@ class HiFiGANVocoder:
         self.generator = self.generator.to(self.device)
         
         print(f"✓ HiFi-GAN vocoder loaded from {generator_path}")
-        print(f"  Sample rate: {sample_rate} Hz")
         print(f"  Device: {self.device}")
 
     @staticmethod
@@ -112,36 +107,26 @@ class HiFiGANVocoder:
 
         return raw_path
     
-    def __call__(self, mel_spectrogram: Tensor, sample_rate: Optional[int] = None) -> Tensor:
+    def __call__(self, mel_spectrogram: Tensor) -> Tensor:
         """
         Convert mel spectrogram to waveform.
         
         Parameters
         ----------
         mel_spectrogram : Tensor
-            Mel spectrogram of shape (batch, mel_frames, n_mels) or (batch, n_mels, mel_frames)
-            Expected n_mels=80, values should be in log scale
-        sample_rate : Optional[int]
-            Target sample rate (defaults to self.sample_rate)
+            Mel spectrogram of shape (batch, mel_frames, n_mels)
+            Values should be in log scale
             
         Returns
         -------
         Tensor
-            Waveform of shape (batch, samples)
+            Waveform of shape (batch, samples) at 22050 Hz
         """
-        if sample_rate is None:
-            sample_rate = self.sample_rate
-        
         # Ensure mel is on correct device
         mel_spectrogram = mel_spectrogram.to(self.device)
         
-        # Handle different input shapes
-        if mel_spectrogram.dim() == 3:
-            # Ensure shape is (batch, n_mels, mel_frames) for HiFi-GAN.
-            if mel_spectrogram.shape[1] == 80:
-                pass
-            elif mel_spectrogram.shape[2] == 80:
-                mel_spectrogram = mel_spectrogram.transpose(1, 2)
+        # Convert from (batch, mel_frames, n_mels) to (batch, n_mels, mel_frames) for HiFi-GAN
+        mel_spectrogram = mel_spectrogram.transpose(1, 2)
         
         # Ensure mel is in log scale (clamp to avoid numerical issues)
         mel_spectrogram = torch.clamp(mel_spectrogram, min=-11.5, max=2.0)
@@ -153,14 +138,5 @@ class HiFiGANVocoder:
         # Squeeze channel dimension: (batch, 1, samples) -> (batch, samples)
         if waveform.dim() == 3:
             waveform = waveform.squeeze(1)
-        
-        # Resample if needed
-        if sample_rate != self.config.sampling_rate:
-            import torchaudio
-            resampler = torchaudio.transforms.Resample(
-                orig_freq=self.config.sampling_rate,
-                new_freq=sample_rate,
-            ).to(self.device)
-            waveform = resampler(waveform)
         
         return waveform

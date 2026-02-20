@@ -42,7 +42,3 @@ class BERTGSTEncoder(nn.Module):
         """(batch,) text → (batch, gst_token_num) GST weights (softmax, sum=1)."""
         pooled = self.get_bert_embeddings(text)
         return F.softmax(self.gst_weight_projection(pooled), dim=1)
-
-    def encode_text(self, text: str) -> Tensor:
-        """Single text → (gst_token_num,) GST weights."""
-        return self.forward([text]).squeeze(0)

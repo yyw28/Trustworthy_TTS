@@ -2,10 +2,10 @@
   "data": {
     "allowed_chars": "!'(),.:;? \\-abcdefghijklmnopqrstuvwxyz",
     "batch_size": 4,
-    "csv_test": "libritts-test.csv",
-    "csv_train": "libritts-train.csv",
-    "csv_val": "libritts-val.csv",
-    "dataset_dir": "./LibriTTS",
+    "csv_test": "/Users/yuwenyu/Desktop/tts_v2/Trustworthy_TTS_v3/LibriTTS/libritts-test.csv",
+    "csv_train": "/Users/yuwenyu/Desktop/tts_v2/Trustworthy_TTS_v3/LibriTTS/libritts-train.csv",
+    "csv_val": "/Users/yuwenyu/Desktop/tts_v2/Trustworthy_TTS_v3/LibriTTS/libritts-val.csv",
+    "dataset_dir": "/Users/yuwenyu/Desktop/tts_v2/Trustworthy_TTS_v3/LibriTTS",
     "end_token": "^",
     "expand_abbreviations": true,
     "num_mels": 80,
@@ -27,7 +27,7 @@
     "hubert_checkpoint_path": null,
     "hubert_model_name": "facebook/hubert-base-ls960",
     "learning_rate": 0.0001,
-    "num_chars": 39,
+    "num_chars": 65,
     "num_mels": 80,
     "postnet_dim": 512,
     "prenet_dim": 256,
@@ -36,13 +36,13 @@
     "rnn_hidden_dim": 1024,
     "save_audio_dir": null,
     "save_audio_every_n_steps": 100,
-    "speaker_count": 1,
-    "speaker_tokens_enabled": false,
+    "speaker_count": 928,
+    "speaker_tokens_enabled": true,
     "teacher_forcing_dropout": 0,
     "use_bert_gst": true,
     "use_rl_training": true,
     "use_vocoder": true,
-    "vocoder_checkpoint_dir": null
+    "vocoder_checkpoint_dir": "/Users/yuwenyu/Desktop/tts_v2/Trustworthy_TTS_v3/UNIVERSAL_V1"
   },
   "optimizer": {
     "class_path": "torch.optim.Adam",
@@ -82,7 +82,7 @@
       }
     },
     "log_every_n_steps": 10,
-    "max_epochs": 100,
+    "max_epochs": 3,
     "precision": "16-mixed"
   }
 }

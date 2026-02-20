@@ -1,8 +1,5 @@
 """
 Reinforcement Learning Policy Network for *soft* GST weights optimization (continuous action).
-
-Modified to match your goal:
-- You DO NOT sample a token index.
 - You DO sample a continuous 10-dim vector of GST weights (on the simplex).
 - Correct REINFORCE: log_prob corresponds to the sampled latent z that produced the weights.
 

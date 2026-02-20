@@ -58,6 +58,7 @@ class TTSModel(pl.LightningModule):
 
         self.save_hyperparameters()
 
+        self.encoded_dim = encoded_dim
         self.speaker_tokens = speaker_tokens_enabled
         self.max_len_override = max_len_override
 
@@ -116,7 +117,6 @@ class TTSModel(pl.LightningModule):
                 freeze_bert=True,
             )
 
-        if self.use_rl_training and self.bert_gst_encoder is not None:
             # RL policy over GST token weights, driven by BERT embeddings.
             bert_hidden_size = self.bert_gst_encoder.bert.config.hidden_size
             self.rl_policy = RLGSTPolicy(
@@ -138,11 +138,24 @@ class TTSModel(pl.LightningModule):
                 p.requires_grad = False
 
             # Vocoder for converting mels to waveforms during RL scoring.
-            if self.use_vocoder:
-                self.vocoder = HiFiGANVocoder(
-                    checkpoint_dir=self.vocoder_checkpoint_dir or "UNIVERSAL_V1",
-                    sample_rate=22050,
-                )
+            # Required for RL training (used to generate waveforms for HuBERT scoring).
+            self.vocoder = HiFiGANVocoder(
+                checkpoint_dir=self.vocoder_checkpoint_dir or "UNIVERSAL_V1",
+                sample_rate=22050,
+            )
+
+        # In RL mode, Tacotron2 + GST should act as fixed, pre-trained components.
+        # Freeze their parameters so only the RL head and related modules train.
+        if self.use_rl_training:
+            for p in self.tacotron2.parameters():
+                p.requires_grad = False
+            if self.gst is not None:
+                for p in self.gst.parameters():
+                    p.requires_grad = False
+            # Ensure they run in eval mode by default (no dropout/stat updates).
+            self.tacotron2.eval()
+            if self.gst is not None:
+                self.gst.eval()
 
     def _get_style_embedding_from_mel(
         self,
@@ -162,7 +175,7 @@ class TTSModel(pl.LightningModule):
 
         Returns style of shape (batch, 1, encoded_dim//2) to match original GST output.
         """
-        if not (self.use_rl_training and self.use_bert_gst and self.training):
+        if not (self.use_rl_training and self.use_bert_gst):
             return None
         if text is None:
             raise ValueError("text is required when use_bert_gst=True and use_rl_training=True")
@@ -171,9 +184,10 @@ class TTSModel(pl.LightningModule):
 
         # BERT pooled embeddings (batch, hidden)
         bert_embeddings = self.bert_gst_encoder.get_bert_embeddings(text)
+        # Use deterministic sampling during validation/inference, stochastic during training
         gst_weights, log_probs, entropy = self.rl_policy(
             bert_embeddings,
-            deterministic=False,
+            deterministic=not self.training,
         )
         self._rl_log_probs = log_probs
         self._rl_entropy = entropy
@@ -183,31 +197,17 @@ class TTSModel(pl.LightningModule):
         style_vec = torch.matmul(gst_weights, tokens)  # (batch, token_dim_per_head)
 
         # Project to encoded_dim//2 if needed to match Tacotron2 extra_encoded_dim.
-        target_dim = self.hparams.encoded_dim // 2
+        target_dim = self.encoded_dim // 2
         token_dim = style_vec.shape[-1]
         if token_dim != target_dim:
             if self._rl_style_proj is None:
+                # Create projection on the same device as the current style tensor.
                 self._rl_style_proj = nn.Linear(token_dim, target_dim)
+                self._rl_style_proj.to(style_vec.device)
             style_vec = self._rl_style_proj(style_vec)
 
         # Shape expected by Tacotron2: (batch, 1, dim)
         return style_vec.unsqueeze(1)
-
-    def _get_style_embedding(
-        self,
-        mel_spectrogram_style: Optional[Tensor],
-        mel_spectrogram_style_len: Optional[Tensor],
-        text: Optional[list[str]],
-    ) -> Optional[Tensor]:
-        """
-        Unified style helper.
-
-        - If RL + BERT GST during training: use text → BERT+policy → GST tokens.
-        - Otherwise: use original GST(ref-mel) path.
-        """
-        if self.use_rl_training and self.use_bert_gst and self.training:
-            return self._get_style_embedding_from_bert(text)
-        return self._get_style_embedding_from_mel(mel_spectrogram_style, mel_spectrogram_style_len)
 
     def forward(
         self,
@@ -221,18 +221,22 @@ class TTSModel(pl.LightningModule):
         max_len_override: Optional[int] = None,
         mel_spectrogram_style: Optional[Tensor] = None,
         mel_spectrogram_style_len: Optional[Tensor] = None,
+        text: Optional[list[str]] = None,
     ):
         style: Tensor | None = None
 
         if self.gst is not None:
-            if self.use_rl_training and self.use_bert_gst and self.training:
-                style = self._get_style_embedding(
-            mel_spectrogram_style=mel_spectrogram_style,
-            mel_spectrogram_style_len=mel_spectrogram_style_len,
-            text=text,
-            )
+            if self.use_rl_training and self.use_bert_gst:
+                # RL path: use BERT + policy to select GST tokens
+                style = self._get_style_embedding_from_bert(text)
             else:
-                style = self.gst(mel_spectrogram_style, mel_spectrogram_style_len)
+                # Original GST path: use reference mel spectrogram
+                style = self._get_style_embedding_from_mel(mel_spectrogram_style, mel_spectrogram_style_len)
+        
+        # Detach style if RL training to prevent gradients flowing through Tacotron2
+        if self.use_rl_training and style is not None:
+            style = style.detach()
+        
         with torch.no_grad():
             return self.tacotron2(
                 chars_idx=chars_idx,
@@ -257,6 +261,7 @@ class TTSModel(pl.LightningModule):
             mel_spectrogram_len=batch.mel_spectrogram_len,
             mel_spectrogram_style=batch.mel_spectrogram,
             mel_spectrogram_style_len=batch.mel_spectrogram_len,
+            text=batch.text,
         )
 
         gate_loss = F.binary_cross_entropy_with_logits(gate, batch.gate)
@@ -303,7 +308,7 @@ class TTSModel(pl.LightningModule):
         if self.use_rl_training:
             self.tacotron2.eval()
 
-        mel_spectrogram, mel_spectrogram_post, gate, alignment = self(
+        mel_spectrogram, mel_spectrogram_post, gate, _ = self(
             chars_idx=batch.chars_idx,
             chars_idx_len=batch.chars_idx_len,
             teacher_forcing=True,
@@ -313,6 +318,7 @@ class TTSModel(pl.LightningModule):
             mel_spectrogram_len=batch.mel_spectrogram_len,
             mel_spectrogram_style=batch.mel_spectrogram,
             mel_spectrogram_style_len=batch.mel_spectrogram_len,
+            text=batch.text,
         )
 
         gate_loss = F.binary_cross_entropy_with_logits(gate, batch.gate)
@@ -332,10 +338,12 @@ class TTSModel(pl.LightningModule):
         if self.use_rl_training:
             if self.vocoder is None:
                 raise RuntimeError("Vocoder is required when use_rl_training=True")
+            # Detach mel before vocoder to prevent gradients flowing through vocoder
+            mel_for_vocoder = mel_spectrogram_post.detach()
             with torch.no_grad():
-                mel_for_vocoder = mel_spectrogram_post.detach()
-                ref_waveforms = self.vocoder(batch.mel_spectrogram, sample_rate=22050).to(self.device)
-            waveforms = self.vocoder(mel_for_vocoder, sample_rate=22050).to(self.device)
+                ref_waveforms = self.vocoder(batch.mel_spectrogram).to(self.device)
+            with torch.no_grad():
+                waveforms = self.vocoder(mel_for_vocoder).to(self.device)
             self._save_audio_if_needed(waveforms, batch_idx)
             rl_loss_for_logging = self.compute_rl_loss(
                 waveforms,
@@ -489,7 +497,8 @@ class TTSModel(pl.LightningModule):
             raise ValueError("HuBERT classifier not initialized")
 
         device = waveforms.device
-        waveforms = waveforms.to(device)
+        # Detach waveforms to prevent gradients flowing through HuBERT
+        waveforms = waveforms.detach().to(device)
         lengths = torch.full((waveforms.shape[0],), waveforms.shape[1], device=device, dtype=torch.long)
         gen_logits, gen_scores = self._hubert_logits_and_scores(waveforms, lengths, sample_rate, device)
 
