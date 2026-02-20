@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import Optional
 
 import torch
-from torch import Tensor
+from torch import Tensor, nn
 
 from tspeech.model.tacotron2.hifi_gan import Generator
 
@@ -16,7 +16,7 @@ class AttrDict(dict):
         self.__dict__ = self
 
 
-class HiFiGANVocoder:
+class HiFiGANVocoder(nn.Module):
     """
     HiFi-GAN vocoder wrapper for converting mel spectrograms to waveforms.
     
@@ -24,12 +24,8 @@ class HiFiGANVocoder:
         vocoder = HiFiGANVocoder(checkpoint_dir="UNIVERSAL_V1")
         waveform = vocoder(mel_spectrogram)  # (batch, mel_frames, n_mels) -> (batch, samples) at 22050 Hz
     """
-    
-    def __init__(
-        self,
-        checkpoint_dir: str,
-        device: Optional[str] = None,
-    ):
+
+    def __init__(self, checkpoint_dir: str):
         """
         Initialize HiFi-GAN vocoder.
         
@@ -37,15 +33,11 @@ class HiFiGANVocoder:
         ----------
         checkpoint_dir : str
             Directory containing config.json and generator checkpoint (e.g., g_02500000)
-        device : Optional[str]
-            Device to run on (cuda, mps, cpu). If None, auto-detects.
         """
+        super().__init__()
+
         self.checkpoint_dir = self._resolve_checkpoint_dir(checkpoint_dir)
-        
-        if device is None:
-            device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
-        self.device = torch.device(device)
-        
+
         # Load config
         config_path = self.checkpoint_dir / "config.json"
         if not config_path.exists():
@@ -70,7 +62,7 @@ class HiFiGANVocoder:
         self.generator = Generator(self.config)
         
         # Load checkpoint
-        checkpoint = torch.load(generator_path, map_location=self.device)
+        checkpoint = torch.load(generator_path)
         if isinstance(checkpoint, dict) and "generator" in checkpoint:
             state_dict = checkpoint["generator"]
         else:
@@ -81,12 +73,8 @@ class HiFiGANVocoder:
         # Remove weight norm for inference
         self.generator.remove_weight_norm()
         self.generator.eval()
-        
-        # Move to device
-        self.generator = self.generator.to(self.device)
-        
+
         print(f"✓ HiFi-GAN vocoder loaded from {generator_path}")
-        print(f"  Device: {self.device}")
 
     @staticmethod
     def _resolve_checkpoint_dir(checkpoint_dir: str) -> Path:
@@ -122,9 +110,6 @@ class HiFiGANVocoder:
         Tensor
             Waveform of shape (batch, samples) at 22050 Hz
         """
-        # Ensure mel is on correct device
-        mel_spectrogram = mel_spectrogram.to(self.device)
-        
         # Convert from (batch, mel_frames, n_mels) to (batch, n_mels, mel_frames) for HiFi-GAN
         mel_spectrogram = mel_spectrogram.transpose(1, 2)
         
