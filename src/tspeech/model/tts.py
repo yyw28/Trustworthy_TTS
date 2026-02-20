@@ -141,7 +141,6 @@ class TTSModel(pl.LightningModule):
             # Required for RL training (used to generate waveforms for HuBERT scoring).
             self.vocoder = HiFiGANVocoder(
                 checkpoint_dir=self.vocoder_checkpoint_dir or "UNIVERSAL_V1",
-                sample_rate=22050,
             )
 
         # In RL mode, Tacotron2 + GST should act as fixed, pre-trained components.
