@@ -342,9 +342,9 @@ class TTSModel(pl.LightningModule):
             mel_for_vocoder = mel_spectrogram_post.detach()
             self.vocoder.eval()
             with torch.no_grad():
-                ref_waveforms = self.vocoder(batch.mel_spectrogram).to(self.device)
+                ref_waveforms = self.vocoder(batch.mel_spectrogram)
             with torch.no_grad():
-                waveforms = self.vocoder(mel_for_vocoder).to(self.device)
+                waveforms = self.vocoder(mel_for_vocoder)
             self._save_audio_if_needed(waveforms, batch_idx)
             rl_loss_for_logging = self.compute_rl_loss(
                 waveforms,
