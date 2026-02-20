@@ -142,6 +142,7 @@ class TTSModel(pl.LightningModule):
             self.vocoder = HiFiGANVocoder(
                 checkpoint_dir=self.vocoder_checkpoint_dir or "UNIVERSAL_V1",
             )
+            self.vocoder.eval()
 
         # In RL mode, Tacotron2 + GST should act as fixed, pre-trained components.
         # Freeze their parameters so only the RL head and related modules train.
