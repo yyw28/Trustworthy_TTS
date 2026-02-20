@@ -2,10 +2,9 @@
   "data": {
     "allowed_chars": "!'(),.:;? \\-abcdefghijklmnopqrstuvwxyz",
     "batch_size": 4,
-    "csv_test": "/Users/yuwenyu/Desktop/tts_v2/Trustworthy_TTS_v3/LibriTTS/libritts-test.csv",
-    "csv_train": "/Users/yuwenyu/Desktop/tts_v2/Trustworthy_TTS_v3/LibriTTS/libritts-train.csv",
-    "csv_val": "/Users/yuwenyu/Desktop/tts_v2/Trustworthy_TTS_v3/LibriTTS/libritts-val.csv",
-    "dataset_dir": "/Users/yuwenyu/Desktop/tts_v2/Trustworthy_TTS_v3/LibriTTS",
+    "csv_test": "libritts-test.csv",
+    "csv_train": "libritts-train.csv",
+    "csv_val": "libritts-val.csv",
     "end_token": "^",
     "expand_abbreviations": true,
     "num_mels": 80,
@@ -41,8 +40,7 @@
     "teacher_forcing_dropout": 0,
     "use_bert_gst": true,
     "use_rl_training": true,
-    "use_vocoder": true,
-    "vocoder_checkpoint_dir": "/Users/yuwenyu/Desktop/tts_v2/Trustworthy_TTS_v3/UNIVERSAL_V1"
+    "use_vocoder": true
   },
   "optimizer": {
     "class_path": "torch.optim.Adam",
@@ -72,7 +70,6 @@
         }
       }
     ],
-    "devices": 1,
     "logger": {
       "class_path": "lightning.pytorch.loggers.TensorBoardLogger",
       "init_args": {
