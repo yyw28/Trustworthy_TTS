@@ -340,6 +340,7 @@ class TTSModel(pl.LightningModule):
                 raise RuntimeError("Vocoder is required when use_rl_training=True")
             # Detach mel before vocoder to prevent gradients flowing through vocoder
             mel_for_vocoder = mel_spectrogram_post.detach()
+            self.vocoder.eval()
             with torch.no_grad():
                 ref_waveforms = self.vocoder(batch.mel_spectrogram).to(self.device)
             with torch.no_grad():
