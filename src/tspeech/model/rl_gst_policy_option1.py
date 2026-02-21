@@ -7,6 +7,7 @@ We use a Logistic-Normal policy:
   z ~ Normal(mu(x), sigma(x))
   gst_weights = softmax(z / temperature)
 """
+
 from typing import Optional, Tuple
 
 import torch
@@ -22,6 +23,7 @@ class RLGSTPolicy(nn.Module):
         self,
         bert_hidden_size: int = 768,
         gst_token_num: int = 10,
+        gst_heads: int = 8,
         hidden_dim: int = 256,
         temperature: float = 1.0,
         init_log_std: float = -0.5,
@@ -30,20 +32,21 @@ class RLGSTPolicy(nn.Module):
     ):
         super().__init__()
         self.gst_token_num = gst_token_num
+        self.gst_heads = gst_heads
         self.temperature = temperature
         self.log_std_min = log_std_min
         self.log_std_max = log_std_max
 
         self.trunk = nn.Sequential(
-            nn.Linear(bert_hidden_size, hidden_dim),
+            nn.Linear(bert_hidden_size, hidden_dim * gst_heads),
             nn.ReLU(),
             nn.Dropout(0.1),
-            nn.Linear(hidden_dim, hidden_dim),
+            nn.Linear(hidden_dim * gst_heads, hidden_dim * gst_heads),
             nn.ReLU(),
             nn.Dropout(0.1),
         )
-        self.mu_head = nn.Linear(hidden_dim, gst_token_num)
-        self.log_std_head = nn.Linear(hidden_dim, gst_token_num)
+        self.mu_head = nn.Linear(hidden_dim * gst_heads, gst_token_num * gst_heads)
+        self.log_std_head = nn.Linear(hidden_dim * gst_heads, gst_token_num * gst_heads)
 
         for m in self.modules():
             if isinstance(m, nn.Linear):
@@ -58,8 +61,12 @@ class RLGSTPolicy(nn.Module):
     ) -> Tuple[Tensor, Optional[Tensor], Optional[Tensor]]:
         """(batch, 768) → (batch, K) weights, (batch,) log_prob or None, (batch,) entropy or None."""
         h = self.trunk(bert_embeddings)
-        mu = self.mu_head(h)
-        log_std = self.log_std_head(h).clamp(self.log_std_min, self.log_std_max)
+        mu = self.mu_head(h).reshape(-1, self.gst_heads, self.gst_token_num)
+        log_std = (
+            self.log_std_head(h)
+            .clamp(self.log_std_min, self.log_std_max)
+            .reshape(-1, self.gst_heads, self.gst_token_num)
+        )
         std = torch.exp(log_std)
         dist = Normal(mu, std)
 
@@ -74,10 +81,10 @@ class RLGSTPolicy(nn.Module):
         gst_weights = F.softmax(z / self.temperature, dim=1)
         return gst_weights, log_probs, entropy
 
-    def get_log_probs(self, bert_embeddings: Tensor, z: Tensor) -> Tensor:
-        """Log prob of z under current policy (for REINFORCE)."""
-        h = self.trunk(bert_embeddings)
-        mu = self.mu_head(h)
-        log_std = self.log_std_head(h).clamp(self.log_std_min, self.log_std_max)
-        std = torch.exp(log_std)
-        return Normal(mu, std).log_prob(z).sum(dim=1)
+    # def get_log_probs(self, bert_embeddings: Tensor, z: Tensor) -> Tensor:
+    #     """Log prob of z under current policy (for REINFORCE)."""
+    #     h = self.trunk(bert_embeddings)
+    #     mu = self.mu_head(h)
+    #     log_std = self.log_std_head(h).clamp(self.log_std_min, self.log_std_max)
+    #     std = torch.exp(log_std)
+    #     return Normal(mu, std).log_prob(z).sum(dim=1)

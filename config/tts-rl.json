@@ -16,31 +16,13 @@
     "trim_top_db": 40
   },
   "model": {
-    "att_dim": 128,
-    "att_rnn_dim": 1024,
     "bert_model_name": "bert-base-uncased",
-    "dropout": 0.5,
-    "encoded_dim": 512,
-    "encoder_kernel_size": 5,
-    "gst_enabled": true,
     "hubert_checkpoint_path": null,
     "hubert_model_name": "facebook/hubert-base-ls960",
-    "learning_rate": 0.0001,
-    "num_chars": 65,
-    "num_mels": 80,
-    "postnet_dim": 512,
-    "prenet_dim": 256,
     "rl_entropy_coef": 0.01,
     "rl_temperature": 1,
-    "rnn_hidden_dim": 1024,
     "save_audio_dir": null,
-    "save_audio_every_n_steps": 100,
-    "speaker_count": 928,
-    "speaker_tokens_enabled": true,
-    "teacher_forcing_dropout": 0,
-    "use_bert_gst": true,
-    "use_rl_training": true,
-    "use_vocoder": true
+    "save_audio_every_n_steps": 100
   },
   "optimizer": {
     "class_path": "torch.optim.Adam",
@@ -79,7 +61,6 @@
       }
     },
     "log_every_n_steps": 10,
-    "max_epochs": 3,
     "precision": "16-mixed"
   }
 }
