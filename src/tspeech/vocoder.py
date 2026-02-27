@@ -62,7 +62,8 @@ class HiFiGANVocoder(nn.Module):
         self.generator = Generator(self.config)
         
         # Load checkpoint
-        checkpoint = torch.load(generator_path)
+        # Allow loading vocoder checkpoints produced on CUDA machines.
+        checkpoint = torch.load(generator_path, map_location="cpu")
         if isinstance(checkpoint, dict) and "generator" in checkpoint:
             state_dict = checkpoint["generator"]
         else:

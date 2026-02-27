@@ -110,15 +110,17 @@ class TTSRLModel(pl.LightningModule):
         with torch.no_grad():
             wav = self.vocoder(batch.mel_spectrogram)
             seq_len = wav.shape[1]
-            mask = (
-                (torch.arange(seq_len, device=self.device)[None, :] < 1000000)
-                .long()
-                .repeat(batch_size, 1, 1)
-            )
 
-            tw_scores = torch.sigmoid(self.tw_classifier(wav=wav, mask=mask)).squeeze(
-                -1
-            )
+            # Approximate per-sample waveform lengths from mel lengths so the HuBERT
+            # attention mask only covers real (unpadded) audio.
+            mel_lens = batch.mel_spectrogram_len.to(self.device).float()  # (B,)
+            max_mel_len = mel_lens.max().clamp(min=1.0)
+            wav_lens = (seq_len * (mel_lens / max_mel_len)).round().long()  # (B,)
+
+            time = torch.arange(seq_len, device=self.device)[None, :]  # (1, T)
+            mask = (time < wav_lens[:, None]).long().unsqueeze(1)  # (B, 1, T)
+
+            tw_scores = torch.sigmoid(self.tw_classifier(wav=wav, mask=mask)).squeeze(-1)
 
         bert_embeddings = self.bert_gst_encoder(score=tw_scores, text=batch.text)
         gst_weights, log_probs, entropy = self.rl_policy(
@@ -143,13 +145,10 @@ class TTSRLModel(pl.LightningModule):
             )
 
             wav_pred = self.vocoder(mel_spectrogram_post)
+            seq_len_pred = wav_pred.shape[1]
 
-            seq_len = wav_pred.shape[1]
-            mask_pred = (
-                (torch.arange(seq_len, device=self.device)[None, :] < 1000000)
-                .long()
-                .repeat(batch_size, 1, 1)
-            )
+            time_pred = torch.arange(seq_len_pred, device=self.device)[None, :]  # (1, T')
+            mask_pred = (time_pred < wav_lens[:, None]).long().unsqueeze(1)  # (B, 1, T')
             tw_scores_pred = torch.sigmoid(
                 self.tw_classifier(wav=wav_pred, mask=mask_pred)
             ).squeeze(-1)
@@ -222,3 +221,91 @@ class TTSRLModel(pl.LightningModule):
         )
 
         return loss
+
+    def validation_step(self, batch, batch_idx: int) -> Tensor:
+        if self.tts.gst is None:
+            raise Exception("oh no")
+
+        batch_size = batch.chars_idx.shape[0]
+
+        with torch.no_grad():
+            # Reference audio HuBERT scores
+            wav = self.vocoder(batch.mel_spectrogram)
+            seq_len = wav.shape[1]
+
+            mel_lens = batch.mel_spectrogram_len.to(self.device).float()  # (B,)
+            max_mel_len = mel_lens.max().clamp(min=1.0)
+            wav_lens = (seq_len * (mel_lens / max_mel_len)).round().long()  # (B,)
+
+            time = torch.arange(seq_len, device=self.device)[None, :]  # (1, T)
+            mask = (time < wav_lens[:, None]).long().unsqueeze(1)  # (B, 1, T)
+
+            tw_scores = torch.sigmoid(self.tw_classifier(wav=wav, mask=mask)).squeeze(-1)
+
+        # Deterministic policy for evaluation
+        bert_embeddings = self.bert_gst_encoder(score=tw_scores, text=batch.text)
+        gst_weights, _, _ = self.rl_policy(
+            bert_embeddings, deterministic=True
+        )
+        style = self.tts.gst.stl.attention.out_proj(
+            torch.matmul(gst_weights, torch.tanh(self.tts.gst.stl.embed)).reshape(
+                batch_size, 1, -1
+            )
+        )
+
+        with torch.no_grad():
+            mel_spectrogram, mel_spectrogram_post, gate, _ = self(
+                chars_idx=batch.chars_idx,
+                chars_idx_len=batch.chars_idx_len,
+                teacher_forcing=True,
+                teacher_forcing_dropout=0,
+                speaker_id=batch.speaker_id,
+                mel_spectrogram=batch.mel_spectrogram,
+                mel_spectrogram_len=batch.mel_spectrogram_len,
+                style=style,
+            )
+
+            wav_pred = self.vocoder(mel_spectrogram_post)
+            seq_len_pred = wav_pred.shape[1]
+
+            time_pred = torch.arange(seq_len_pred, device=self.device)[None, :]  # (1, T')
+            mask_pred = (time_pred < wav_lens[:, None]).long().unsqueeze(1)  # (B, 1, T')
+            tw_scores_pred = torch.sigmoid(
+                self.tw_classifier(wav=wav_pred, mask=mask_pred)
+            ).squeeze(-1)
+
+        tts_loss = (
+            F.binary_cross_entropy_with_logits(gate, batch.gate)
+            + F.mse_loss(mel_spectrogram, batch.mel_spectrogram)
+            + F.mse_loss(mel_spectrogram_post, batch.mel_spectrogram)
+        )
+
+        score_loss = F.mse_loss(tw_scores, tw_scores_pred)
+        val_loss = score_loss + tts_loss
+
+        self.log(
+            "val_tts_loss",
+            tts_loss,
+            on_step=False,
+            on_epoch=True,
+            sync_dist=True,
+            batch_size=mel_spectrogram.shape[0],
+        )
+        self.log(
+            "val_score_loss",
+            score_loss,
+            on_step=False,
+            on_epoch=True,
+            sync_dist=True,
+            batch_size=mel_spectrogram.shape[0],
+        )
+        self.log(
+            "val_loss",
+            val_loss,
+            on_step=False,
+            on_epoch=True,
+            sync_dist=True,
+            batch_size=mel_spectrogram.shape[0],
+        )
+
+        return val_loss
