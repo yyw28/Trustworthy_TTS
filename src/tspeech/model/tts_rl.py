@@ -113,14 +113,14 @@ class TTSRLModel(pl.LightningModule):
 
             # Approximate per-sample waveform lengths from mel lengths so the HuBERT
             # attention mask only covers real (unpadded) audio.
-            mel_lens = batch.mel_spectrogram_len.to(self.device).float()  # (B,)
-            max_mel_len = mel_lens.max().clamp(min=1.0)
-            wav_lens = (seq_len * (mel_lens / max_mel_len)).round().long()  # (B,)
+            wav_lens = batch.mel_spectrogram_len * 256
 
             time = torch.arange(seq_len, device=self.device)[None, :]  # (1, T)
-            mask = (time < wav_lens[:, None]).long().unsqueeze(1)  # (B, 1, T)
+            mask = time < wav_lens[:, None]  # (B, T)
 
-            tw_scores = torch.sigmoid(self.tw_classifier(wav=wav, mask=mask)).squeeze(-1)
+            tw_scores = torch.sigmoid(self.tw_classifier(wav=wav, mask=mask)).squeeze(
+                -1
+            )
 
         bert_embeddings = self.bert_gst_encoder(score=tw_scores, text=batch.text)
         gst_weights, log_probs, entropy = self.rl_policy(
@@ -147,8 +147,18 @@ class TTSRLModel(pl.LightningModule):
             wav_pred = self.vocoder(mel_spectrogram_post)
             seq_len_pred = wav_pred.shape[1]
 
-            time_pred = torch.arange(seq_len_pred, device=self.device)[None, :]  # (1, T')
-            mask_pred = (time_pred < wav_lens[:, None]).long().unsqueeze(1)  # (B, 1, T')
+            pred_wav_lengths = (gate.squeeze(-1) < 0).int().argmax(axis=1)
+            
+            # If the gate fails to predict the end of the clip, assume it takes the whole wav length
+            pred_wav_lengths[pred_wav_lengths == 0] = gate.shape[1] - 1
+
+            # Multiply by 256 to calculate final wav output
+            pred_wav_lengths *= 256
+
+            time_pred = torch.arange(seq_len_pred, device=self.device)[
+                None, :
+            ]  # (1, T')
+            mask_pred = time_pred < pred_wav_lengths[:, None]  # (B, T')
             tw_scores_pred = torch.sigmoid(
                 self.tw_classifier(wav=wav_pred, mask=mask_pred)
             ).squeeze(-1)
@@ -233,20 +243,18 @@ class TTSRLModel(pl.LightningModule):
             wav = self.vocoder(batch.mel_spectrogram)
             seq_len = wav.shape[1]
 
-            mel_lens = batch.mel_spectrogram_len.to(self.device).float()  # (B,)
-            max_mel_len = mel_lens.max().clamp(min=1.0)
-            wav_lens = (seq_len * (mel_lens / max_mel_len)).round().long()  # (B,)
+            wav_lens = batch.mel_spectrogram_len * 256
 
             time = torch.arange(seq_len, device=self.device)[None, :]  # (1, T)
             mask = (time < wav_lens[:, None]).long().unsqueeze(1)  # (B, 1, T)
 
-            tw_scores = torch.sigmoid(self.tw_classifier(wav=wav, mask=mask)).squeeze(-1)
+            tw_scores = torch.sigmoid(self.tw_classifier(wav=wav, mask=mask)).squeeze(
+                -1
+            )
 
         # Deterministic policy for evaluation
         bert_embeddings = self.bert_gst_encoder(score=tw_scores, text=batch.text)
-        gst_weights, _, _ = self.rl_policy(
-            bert_embeddings, deterministic=True
-        )
+        gst_weights, _, _ = self.rl_policy(bert_embeddings, deterministic=True)
         style = self.tts.gst.stl.attention.out_proj(
             torch.matmul(gst_weights, torch.tanh(self.tts.gst.stl.embed)).reshape(
                 batch_size, 1, -1
@@ -268,8 +276,19 @@ class TTSRLModel(pl.LightningModule):
             wav_pred = self.vocoder(mel_spectrogram_post)
             seq_len_pred = wav_pred.shape[1]
 
-            time_pred = torch.arange(seq_len_pred, device=self.device)[None, :]  # (1, T')
-            mask_pred = (time_pred < wav_lens[:, None]).long().unsqueeze(1)  # (B, 1, T')
+            pred_wav_lengths = (gate.squeeze(-1) < 0).int().argmax(axis=1)
+            
+            # If the gate fails to predict the end of the clip, assume it takes the whole wav length
+            pred_wav_lengths[pred_wav_lengths == 0] = gate.shape[1] - 1
+
+            # Multiply by 256 to calculate final wav output
+            pred_wav_lengths *= 256
+
+            time_pred = torch.arange(seq_len_pred, device=self.device)[
+                None, :
+            ]  # (1, T')
+            mask_pred = (time_pred < pred_wav_lengths[:, None])  # (B, T')
+
             tw_scores_pred = torch.sigmoid(
                 self.tw_classifier(wav=wav_pred, mask=mask_pred)
             ).squeeze(-1)
