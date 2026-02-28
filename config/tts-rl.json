@@ -1,7 +1,7 @@
 {
   "data": {
     "allowed_chars": "!'(),.:;? \\-abcdefghijklmnopqrstuvwxyz",
-    "batch_size": 4,
+    "batch_size": 64,
     "csv_test": "libritts-test.csv",
     "csv_train": "libritts-train.csv",
     "csv_val": "libritts-val.csv",
