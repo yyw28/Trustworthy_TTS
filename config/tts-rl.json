@@ -1,14 +1,14 @@
 {
   "data": {
     "allowed_chars": "!'(),.:;? \\-abcdefghijklmnopqrstuvwxyz",
-    "batch_size": 64,
+    "batch_size": 32,
     "csv_test": "libritts-test.csv",
     "csv_train": "libritts-train.csv",
     "csv_val": "libritts-val.csv",
     "end_token": "^",
     "expand_abbreviations": true,
     "num_mels": 80,
-    "num_workers": 2,
+    "num_workers": 4,
     "sample_rate": 22050,
     "silence": 0,
     "trim": true,
@@ -48,7 +48,7 @@
           "mode": "min",
           "monitor": "val_loss",
           "save_last": true,
-          "save_top_k": 3
+          "save_top_k": 1
         }
       }
     ],

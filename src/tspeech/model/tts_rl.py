@@ -163,11 +163,10 @@ class TTSRLModel(pl.LightningModule):
                 self.tw_classifier(wav=wav_pred, mask=mask_pred)
             ).squeeze(-1)
 
-        tts_loss = (
-            F.binary_cross_entropy_with_logits(gate, batch.gate)
-            + F.mse_loss(mel_spectrogram, batch.mel_spectrogram)
-            + F.mse_loss(mel_spectrogram_post, batch.mel_spectrogram)
-        )
+        gate_loss = F.binary_cross_entropy_with_logits(gate, batch.gate)
+        mel_loss = F.mse_loss(mel_spectrogram, batch.mel_spectrogram)
+        mel_post_loss = F.mse_loss(mel_spectrogram_post, batch.mel_spectrogram)
+        tts_loss = gate_loss + mel_loss + mel_post_loss
 
         score_loss = F.mse_loss(tw_scores, tw_scores_pred)
         reward = -(score_loss + tts_loss)
@@ -176,6 +175,30 @@ class TTSRLModel(pl.LightningModule):
 
         loss = reinforce_loss  # + entropy_bonus
 
+        self.log(
+            "training_gate_loss",
+            gate_loss.detach(),
+            on_step=True,
+            on_epoch=True,
+            sync_dist=True,
+            batch_size=mel_spectrogram.shape[0],
+        )
+        self.log(
+            "training_mel_loss",
+            mel_loss.detach(),
+            on_step=True,
+            on_epoch=True,
+            sync_dist=True,
+            batch_size=mel_spectrogram.shape[0],
+        )
+        self.log(
+            "training_mel_post_loss",
+            mel_post_loss.detach(),
+            on_step=True,
+            on_epoch=True,
+            sync_dist=True,
+            batch_size=mel_spectrogram.shape[0],
+        )
         self.log(
             "training_tts_loss",
             tts_loss.detach(),
@@ -293,15 +316,38 @@ class TTSRLModel(pl.LightningModule):
                 self.tw_classifier(wav=wav_pred, mask=mask_pred)
             ).squeeze(-1)
 
-        tts_loss = (
-            F.binary_cross_entropy_with_logits(gate, batch.gate)
-            + F.mse_loss(mel_spectrogram, batch.mel_spectrogram)
-            + F.mse_loss(mel_spectrogram_post, batch.mel_spectrogram)
-        )
+        gate_loss = F.binary_cross_entropy_with_logits(gate, batch.gate)
+        mel_loss = F.mse_loss(mel_spectrogram, batch.mel_spectrogram)
+        mel_post_loss = F.mse_loss(mel_spectrogram_post, batch.mel_spectrogram)
+        tts_loss = gate_loss + mel_loss + mel_post_loss
 
         score_loss = F.mse_loss(tw_scores, tw_scores_pred)
         val_loss = score_loss + tts_loss
 
+        self.log(
+            "val_gate_loss",
+            gate_loss,
+            on_step=False,
+            on_epoch=True,
+            sync_dist=True,
+            batch_size=mel_spectrogram.shape[0],
+        )
+        self.log(
+            "val_mel_loss",
+            mel_loss,
+            on_step=False,
+            on_epoch=True,
+            sync_dist=True,
+            batch_size=mel_spectrogram.shape[0],
+        )
+        self.log(
+            "val_mel_post_loss",
+            mel_post_loss,
+            on_step=False,
+            on_epoch=True,
+            sync_dist=True,
+            batch_size=mel_spectrogram.shape[0],
+        )
         self.log(
             "val_tts_loss",
             tts_loss,

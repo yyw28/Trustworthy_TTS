@@ -3,14 +3,14 @@
 Generate audio from text with a trained RL TTS checkpoint and score with HuBERT.
 """
 import argparse
+import csv
 import json
 import re
+import shutil
 import sys
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Optional
 
-import librosa
-import numpy as np
 import pandas as pd
 import soundfile as sf
 import torch
@@ -47,18 +47,20 @@ def _expand_abbreviations(text: str) -> str:
     return text
 
 
-from tspeech.model.tts import TTSModel
 from tspeech.model.tts_rl import TTSRLModel
-
-
-def _read_texts_from_csv(csv_path: Path) -> list[str]:
-    df = pd.read_csv(csv_path, delimiter="|", header=None, names=["wav", "text", "speaker_idx"])
-    return df["text"].astype(str).tolist()
 
 
 def _read_libritts_csv(csv_path: Path) -> list[dict]:
     """Read LibriTTS CSV (wav|speaker_id|text|duration|speaker_idx with header)."""
-    df = pd.read_csv(csv_path, delimiter="|", header=0, names=["wav", "speaker_id", "text", "duration", "speaker_idx"])
+    df = pd.read_csv(
+        csv_path,
+        delimiter="|",
+        header=0,
+        names=["wav", "speaker_id", "text", "duration", "speaker_idx"],
+        quoting=csv.QUOTE_NONE,
+        engine="python",
+        on_bad_lines="skip",
+    )
     return df.to_dict(orient="records")
 
 
@@ -97,72 +99,6 @@ def _resolve_wav_path(wav_path: str, base_dir: Optional[Path]) -> Path:
     return base_dir / candidate
 
 
-def _build_style_mel(
-    wav_path: Path,
-    sample_rate: int,
-    top_db: int,
-    frame_length: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    wav, sr = torchaudio.load(str(wav_path))
-    if sr != sample_rate:
-        wav = torchaudio.functional.resample(wav, sr, sample_rate)
-    if wav.dim() == 2 and wav.size(0) > 1:
-        wav = wav.mean(dim=0)
-    else:
-        wav = wav.squeeze(0)
-
-    wav_np, _ = librosa.effects.trim(
-        wav.cpu().numpy(),
-        top_db=top_db,
-        frame_length=frame_length,
-    )
-    wav = torch.tensor(wav_np)
-
-    melspectrogram = torchaudio.transforms.MelSpectrogram(
-        sample_rate=sample_rate,
-        n_fft=1024,
-        win_length=1024,
-        hop_length=256,
-        f_min=0.0,
-        f_max=8000.0,
-        n_mels=80,
-        power=1.0,
-        mel_scale="slaney",
-        norm="slaney",
-        center=True,
-    )
-    mel_spectrogram_style = melspectrogram(wav).swapaxes(0, 1)
-    mel_spectrogram_style = torch.log(torch.clamp(mel_spectrogram_style, min=1e-5)).unsqueeze(0)
-    mel_spectrogram_style_len = torch.IntTensor([mel_spectrogram_style.shape[1]])
-    return mel_spectrogram_style, mel_spectrogram_style_len
-
-
-def _trim_waveforms(waveforms: torch.Tensor, top_db: int = 40, frame_length: int = 1024) -> tuple[torch.Tensor, torch.Tensor]:
-    waveforms_np = waveforms.detach().cpu().numpy()
-    trimmed = []
-    lengths = []
-    for wav in waveforms_np:
-        wav_trim, _ = librosa.effects.trim(wav, top_db=top_db, frame_length=frame_length)
-        trimmed.append(wav_trim)
-        lengths.append(len(wav_trim))
-
-    max_len = max(lengths) if lengths else 0
-    padded = np.zeros((len(trimmed), max_len), dtype=waveforms_np.dtype)
-    for i, wav in enumerate(trimmed):
-        padded[i, : len(wav)] = wav
-
-    return torch.tensor(padded), torch.tensor(lengths)
-
-
-def _noise_gate(waveforms: torch.Tensor, gate_db: float = -40.0) -> torch.Tensor:
-    # Simple per-sample RMS gate.
-    if waveforms.numel() == 0:
-        return waveforms
-    rms = torch.sqrt(torch.mean(waveforms ** 2, dim=1, keepdim=True) + 1e-12)
-    gate = (20 * torch.log10(rms + 1e-12)) > gate_db
-    return waveforms * gate
-
-
 def _score_with_hubert(waveforms: torch.Tensor, lengths: torch.Tensor, device: torch.device, hubert_checkpoint: str):
     from tspeech.model.htmodel import HTModel
 
@@ -184,6 +120,53 @@ def _score_with_hubert(waveforms: torch.Tensor, lengths: torch.Tensor, device: t
     ).long()
     logits = hubert(wav=waveforms_16k, mask=attention_mask)
     return torch.sigmoid(logits).squeeze(-1)
+
+
+def _load_texts_and_samples(args) -> tuple[list[str], list[dict]]:
+    texts: list[str] = []
+    samples: list[dict] = []
+
+    # Direct text input (CLI flags / file)
+    if args.text:
+        texts.extend([t for t in args.text if t.strip()])
+    if args.texts_file:
+        texts_path = Path(args.texts_file)
+        texts.extend([line.strip() for line in texts_path.read_text().splitlines() if line.strip()])
+
+    # LibriTTS CSV path takes precedence over generic encoder CSV
+    libritts_csv: Optional[Path] = Path(args.libritts_csv) if args.libritts_csv else None
+    if libritts_csv is not None:
+        if not libritts_csv.exists():
+            raise FileNotFoundError(f"LibriTTS CSV not found: {libritts_csv}")
+        samples = _read_libritts_csv(libritts_csv)
+        if args.num_samples is not None:
+            if len(samples) < args.num_samples:
+                raise ValueError(f"Not enough rows in {libritts_csv} to sample {args.num_samples}")
+            import random
+
+            samples = random.sample(samples, args.num_samples)
+        texts = [str(row["text"]).strip().strip('"') for row in samples]
+    else:
+        encoder_csv: Optional[Path] = Path(args.encoder_csv) if args.encoder_csv else None
+        if encoder_csv is None:
+            default_csv = Path("tis_tts_data/train.csv")
+            if default_csv.exists():
+                encoder_csv = default_csv
+
+        if args.num_samples is not None:
+            if encoder_csv is None:
+                raise ValueError("--num_samples requires --encoder_csv or --libritts_csv")
+            df = pd.read_csv(encoder_csv, delimiter="|", header=None, names=["wav", "text", "speaker_idx"])
+            if len(df) < args.num_samples:
+                raise ValueError(f"Not enough texts in {encoder_csv} to sample {args.num_samples}")
+            df = df.sample(args.num_samples, random_state=42)
+            samples = df.to_dict(orient="records")
+            texts = [row["text"] for row in samples]
+
+    if not texts:
+        raise ValueError("Provide --text/--texts_file or use --num_samples with a CSV")
+
+    return texts, samples
 
 
 def main() -> None:
@@ -245,7 +228,6 @@ def main() -> None:
         default="auto",
         help="Device for TTS model (auto/cuda/mps/cpu). 'auto' uses cuda if available, else mps, else cpu.",
     )
-    parser.add_argument("--expand_abbreviations", action="store_true", default=True, help="Expand abbreviations")
     parser.add_argument("--end_token", type=str, default="^", help="End token")
     parser.add_argument(
         "--allowed_chars",
@@ -254,55 +236,14 @@ def main() -> None:
         help="Allowed characters for text normalization",
     )
     parser.add_argument("--max_len", type=int, default=None, help="Override max mel length")
-    parser.add_argument("--trim_top_db", type=int, default=40, help="Trim threshold in dB (higher trims more)")
-    parser.add_argument("--noise_gate_db", type=float, default=-40.0, help="RMS noise gate in dB")
     args = parser.parse_args()
-
-    texts: list[str] = []
-    samples: list[dict] = []
-    if args.text:
-        texts.extend([t for t in args.text if t.strip()])
-    if args.texts_file:
-        texts_path = Path(args.texts_file)
-        texts.extend([line.strip() for line in texts_path.read_text().splitlines() if line.strip()])
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    libritts_csv: Optional[Path] = Path(args.libritts_csv) if args.libritts_csv else None
-    if libritts_csv is not None:
-        if not libritts_csv.exists():
-            raise FileNotFoundError(f"LibriTTS CSV not found: {libritts_csv}")
-        samples = _read_libritts_csv(libritts_csv)
-        if args.num_samples is not None:
-            if len(samples) < args.num_samples:
-                raise ValueError(f"Not enough rows in {libritts_csv} to sample {args.num_samples}")
-            import random
-            samples = random.sample(samples, args.num_samples)
-        texts = [str(row["text"]).strip().strip('"') for row in samples]
+    texts, samples = _load_texts_and_samples(args)
 
-    else:
-        encoder_csv: Optional[Path] = Path(args.encoder_csv) if args.encoder_csv else None
-        if encoder_csv is None:
-            default_csv = Path("tis_tts_data/train.csv")
-            if default_csv.exists():
-                encoder_csv = default_csv
-
-        if args.num_samples is not None:
-            if encoder_csv is None:
-                raise ValueError("--num_samples requires --encoder_csv or --libritts_csv")
-            df = pd.read_csv(encoder_csv, delimiter="|", header=None, names=["wav", "text", "speaker_idx"])
-            if len(df) < args.num_samples:
-                raise ValueError(f"Not enough texts in {encoder_csv} to sample {args.num_samples}")
-            df = df.sample(args.num_samples, random_state=42)
-            samples = df.to_dict(orient="records")
-            texts = [row["text"] for row in samples]
-
-    if not texts:
-        raise ValueError("Provide --text/--texts_file or use --num_samples with a CSV")
-
-    if args.expand_abbreviations:
-        texts = [_expand_abbreviations(t) for t in texts]
+    texts = [_expand_abbreviations(t) for t in texts]
     texts = [_normalize_text(t, args.allowed_chars) for t in texts]
     if samples:
         for idx, row in enumerate(samples):
@@ -373,14 +314,46 @@ def main() -> None:
             score = None  # Computed below via HuBERT if needed
 
             waveform = vocoder(mel_postnet).cpu()
-            waveform, lengths = _trim_waveforms(waveform, top_db=args.trim_top_db)
-            waveform = _noise_gate(waveform, gate_db=args.noise_gate_db)
+
+            # Estimate predicted waveform lengths from the gate output.
+            # Assumes the gate always predicts an end-of-clip position.
+            gate_end = gate.squeeze(-1) < 0  # (B, T_mel)
+            end_idx = gate_end.int().argmax(dim=1)  # first end frame index (0 if none)
+            has_end = gate_end.any(dim=1)
+
+            # Convert end index to number of mel frames (inclusive), and fall back to full length if no end.
+            pred_mel_frames = torch.where(
+                has_end,
+                end_idx + 1,
+                torch.full_like(end_idx, gate.shape[1]),
+            )
+
+            # Multiply by 256 (hop length) to calculate final wav length in samples.
+            pred_wav_lengths = pred_mel_frames * 256
+            pred_wav_lengths = pred_wav_lengths.clamp(min=256, max=waveform.shape[-1])
+
             if score is None and args.hubert_checkpoint:
-                score = _score_with_hubert(waveform, lengths, device, args.hubert_checkpoint).cpu()
+                score = _score_with_hubert(
+                    waveform, pred_wav_lengths, device, args.hubert_checkpoint
+                ).cpu()
                 score = score[0]
             basename = _output_basename(idx, row)
             wav_path = output_dir / f"{basename}.wav"
-            sf.write(str(wav_path), waveform[0].cpu().numpy(), 22050)
+            wav_len = int(pred_wav_lengths[0].clamp(min=1, max=waveform.shape[-1]).item())
+            wav_to_save = waveform[0]
+            if wav_to_save.dim() == 2:
+                wav_to_save = wav_to_save.squeeze(0)
+            wav_to_save = wav_to_save[:wav_len]
+            sf.write(str(wav_path), wav_to_save.cpu().numpy(), 22050)
+
+            # Save the original (reference) test wav alongside the generated wav when available.
+            if row and "wav" in row:
+                try:
+                    ref_wav_src = _resolve_wav_path(str(row["wav"]), base_dir)
+                    ref_wav_dst = output_dir / f"{basename}_ref.wav"
+                    shutil.copy2(ref_wav_src, ref_wav_dst)
+                except Exception as e:
+                    print(f"Warning: failed to copy reference wav for {basename}: {e}")
 
             results.append(
                 {
