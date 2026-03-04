@@ -6,6 +6,7 @@ from torch import nn
 import torch
 from torch import Tensor
 from torch.nn import functional as F
+import numpy as np
 
 from tspeech.data.tts import TTSBatch
 from tspeech.model.tacotron2 import Tacotron2
@@ -254,6 +255,50 @@ class TTSRLModel(pl.LightningModule):
         )
 
         return loss
+
+    def on_train_batch_end(self, outputs, batch, batch_idx: int) -> None:
+        """Log parameter histograms during training, at the same frequency as validation.
+
+        We log only on batches that trigger a validation check (controlled by ``val_check_interval``)
+        to keep overhead reasonable while still getting multiple snapshots per epoch.
+        """
+        trainer = getattr(self, "trainer", None)
+        if trainer is None or trainer.sanity_checking:
+            return
+
+        # `val_check_batch` is the interval (in steps) at which validation runs.
+        val_check_batch = getattr(trainer, "val_check_batch", None)
+        if not val_check_batch or (trainer.global_step + 1) % val_check_batch != 0:
+            return
+
+        logger = getattr(self, "logger", None)
+        experiment = getattr(logger, "experiment", None) if logger is not None else None
+        if experiment is None:
+            return
+
+        for tag, param in self.named_parameters():
+            # Some parameters (or their gradients) can be empty tensors or contain
+            # only NaN/Inf values depending on model configuration. TensorBoard's
+            # histogram implementation raises if it receives an empty array after
+            # filtering invalid values, so we guard against that here.
+            if param.grad is not None:
+                grad = param.grad.detach().cpu()
+                if grad.numel() > 0:
+                    grad_np = grad.numpy().ravel()
+                    grad_np = grad_np[np.isfinite(grad_np)]
+                    if grad_np.size > 0:
+                        experiment.add_histogram(
+                            f"grad/{tag}", grad_np, self.global_step
+                        )
+
+            weight = param.detach().cpu()
+            if weight.numel() > 0:
+                weight_np = weight.numpy().ravel()
+                weight_np = weight_np[np.isfinite(weight_np)]
+                if weight_np.size > 0:
+                    experiment.add_histogram(
+                        f"weight/{tag}", weight_np, self.global_step
+                    )
 
     def validation_step(self, batch, batch_idx: int) -> Tensor:
         if self.tts.gst is None:

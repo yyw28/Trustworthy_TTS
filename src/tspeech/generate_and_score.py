@@ -355,11 +355,15 @@ def main() -> None:
                 except Exception as e:
                     print(f"Warning: failed to copy reference wav for {basename}: {e}")
 
+            # Average GST weights across heads to get per-token weights.
+            gst_weights_tokens = gst_weights.mean(dim=1)[0].detach().cpu().tolist()
+
             results.append(
                 {
                     "text": text,
                     "wav_path": str(wav_path),
                     "trustworthiness_score": float(score.item()) if score is not None else None,
+                    "gst_weights": gst_weights_tokens,
                 }
             )
 
