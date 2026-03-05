@@ -84,6 +84,9 @@ class STL(nn.Module):
         ref_enc_gru_size: int,
     ):
         super().__init__()
+        self.token_embedding_size = token_embedding_size
+        self.num_heads = num_heads
+
         self.embed = nn.Parameter(
             torch.FloatTensor(token_num, token_embedding_size // num_heads)
         )

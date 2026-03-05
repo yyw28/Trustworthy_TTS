@@ -23,9 +23,13 @@ class BERTEncoder(nn.Module):
         )
 
         # self.tw = nn.Sequential(nn.Linear(self.bert.))
-        if freeze_bert:
-            for p in self.bert.parameters():
-                p.requires_grad = False
+        for p in self.bert.parameters():
+            p.requires_grad = False
+
+        if not freeze_bert:
+            for i in range(-3, 0):
+                for p in self.bert.encoder.layer[i].parameters():
+                    p.requires_grad = True
 
     def forward(self, score: Tensor, text: list[str]) -> Tensor:
         tokenized = self.tokenizer(

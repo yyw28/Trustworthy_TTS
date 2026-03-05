@@ -127,11 +127,18 @@ class TTSRLModel(pl.LightningModule):
         gst_weights, log_probs, entropy = self.rl_policy(
             bert_embeddings, deterministic=not self.training
         )
-        style = self.tts.gst.stl.attention.out_proj(
-            torch.matmul(gst_weights, torch.tanh(self.tts.gst.stl.embed)).reshape(
-                batch_size, 1, -1
-            )
+
+        style = torch.bmm(
+            gst_weights.unsqueeze(1),
+            torch.tanh(self.tts.gst.stl.embed)[None, :, :].expand(
+                batch_size * self.tts.gst.stl.num_heads, -1, -1
+            ),
         )
+        style = (
+            style.transpose(0, 1)
+            .view(batch_size, self.tts.gst.stl.token_embedding_size)
+        )
+        style = self.tts.gst.stl.attention.out_proj(style).unsqueeze(1)
 
         with torch.no_grad():
             mel_spectrogram, mel_spectrogram_post, gate, _ = self(
@@ -149,7 +156,7 @@ class TTSRLModel(pl.LightningModule):
             seq_len_pred = wav_pred.shape[1]
 
             pred_wav_lengths = (gate.squeeze(-1) < 0).int().argmax(axis=1)
-            
+
             # If the gate fails to predict the end of the clip, assume it takes the whole wav length
             pred_wav_lengths[pred_wav_lengths == 0] = gate.shape[1] - 1
 
@@ -171,7 +178,7 @@ class TTSRLModel(pl.LightningModule):
 
         score_loss = F.mse_loss(tw_scores, tw_scores_pred)
         reward = -(score_loss + tts_loss)
-        reinforce_loss = (log_probs.reshape(batch_size, -1) * reward.detach()).mean()
+        reinforce_loss = (-log_probs.reshape(batch_size, -1) * reward.detach()).mean()
         # entropy_bonus = self.rl_entropy_coef * entropy.mean()
 
         loss = reinforce_loss  # + entropy_bonus
@@ -339,7 +346,7 @@ class TTSRLModel(pl.LightningModule):
             seq_len_pred = wav_pred.shape[1]
 
             pred_wav_lengths = (gate.squeeze(-1) < 0).int().argmax(axis=1)
-            
+
             # If the gate fails to predict the end of the clip, assume it takes the whole wav length
             pred_wav_lengths[pred_wav_lengths == 0] = gate.shape[1] - 1
 
@@ -349,7 +356,7 @@ class TTSRLModel(pl.LightningModule):
             time_pred = torch.arange(seq_len_pred, device=self.device)[
                 None, :
             ]  # (1, T')
-            mask_pred = (time_pred < pred_wav_lengths[:, None])  # (B, T')
+            mask_pred = time_pred < pred_wav_lengths[:, None]  # (B, T')
 
             tw_scores_pred = torch.sigmoid(
                 self.tw_classifier(wav=wav_pred, mask=mask_pred)
