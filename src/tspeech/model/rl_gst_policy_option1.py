@@ -69,14 +69,9 @@ class RLGSTPolicy(nn.Module):
         )
         std = torch.exp(log_std)
         dist = Normal(mu, std)
-
-        if deterministic:
-            z = mu
-            log_probs, entropy = None, None
-        else:
-            z = dist.rsample()
-            log_probs = dist.log_prob(z).sum(dim=1)
-            entropy = dist.entropy().sum(dim=1)
+        z = dist.rsample()
+        log_probs = dist.log_prob(z).sum(dim=1)
+        entropy = dist.entropy().sum(dim=1)
 
         gst_weights = F.softmax(z / self.temperature, dim=1)
         return gst_weights, log_probs, entropy

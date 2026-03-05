@@ -277,28 +277,22 @@ class TTSRLModel(pl.LightningModule):
             return
 
         for tag, param in self.named_parameters():
-            # Some parameters (or their gradients) can be empty tensors or contain
-            # only NaN/Inf values depending on model configuration. TensorBoard's
-            # histogram implementation raises if it receives an empty array after
-            # filtering invalid values, so we guard against that here.
-            if param.grad is not None:
+            if param.requires_grad and param.grad is not None:
                 grad = param.grad.detach().cpu()
-                if grad.numel() > 0:
-                    grad_np = grad.numpy().ravel()
-                    grad_np = grad_np[np.isfinite(grad_np)]
-                    if grad_np.size > 0:
-                        experiment.add_histogram(
-                            f"grad/{tag}", grad_np, self.global_step
+                #if grad.numel() > 0:
+                    #grad_np = grad.numpy().ravel()
+                    #grad_np = grad_np[np.isfinite(grad_np)]
+                    #if grad_np.size > 0:
+                experiment.add_histogram(f"grad/{tag}", grad, self.global_step
                         )
 
-            weight = param.detach().cpu()
-            if weight.numel() > 0:
-                weight_np = weight.numpy().ravel()
-                weight_np = weight_np[np.isfinite(weight_np)]
-                if weight_np.size > 0:
-                    experiment.add_histogram(
-                        f"weight/{tag}", weight_np, self.global_step
-                    )
+                weight = param.detach().cpu()
+                #if weight.numel() > 0:
+                    #weight_np = weight.numpy().ravel()
+                    #weight_np = weight_np[np.isfinite(weight_np)]
+                    #if weight_np.size > 0:
+                experiment.add_histogram(f"weight/{tag}", weight, self.global_step
+                        )
 
     def validation_step(self, batch, batch_idx: int) -> Tensor:
         if self.tts.gst is None:
