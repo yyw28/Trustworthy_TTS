@@ -324,11 +324,19 @@ class TTSRLModel(pl.LightningModule):
         # Deterministic policy for evaluation
         bert_embeddings = self.bert_gst_encoder(score=tw_scores, text=batch.text)
         gst_weights, _, _ = self.rl_policy(bert_embeddings, deterministic=True)
-        style = self.tts.gst.stl.attention.out_proj(
-            torch.matmul(gst_weights, torch.tanh(self.tts.gst.stl.embed)).reshape(
-                batch_size, 1, -1
-            )
+        
+        style = torch.bmm(
+            gst_weights.unsqueeze(1),
+            torch.tanh(self.tts.gst.stl.embed)[None, :, :].expand(
+                batch_size * self.tts.gst.stl.num_heads, -1, -1
+            ),
         )
+        style = (
+            style.transpose(0, 1)
+            .view(batch_size, self.tts.gst.stl.token_embedding_size)
+        )
+        style = self.tts.gst.stl.attention.out_proj(style).unsqueeze(1)
+
 
         with torch.no_grad():
             mel_spectrogram, mel_spectrogram_post, gate, _ = self(
