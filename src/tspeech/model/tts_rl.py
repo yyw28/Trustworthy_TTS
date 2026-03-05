@@ -176,7 +176,7 @@ class TTSRLModel(pl.LightningModule):
         mel_post_loss = F.mse_loss(mel_spectrogram_post, batch.mel_spectrogram)
         tts_loss = gate_loss + mel_loss + mel_post_loss
 
-        score_loss = F.mse_loss(tw_scores, tw_scores_pred)
+        score_loss = (tw_scores - tw_scores_pred).abs().mean(-1)
         reward = -(score_loss + tts_loss)
         reinforce_loss = (-log_probs.reshape(batch_size, -1) * reward.detach()).mean()
         # entropy_bonus = self.rl_entropy_coef * entropy.mean()
@@ -375,7 +375,7 @@ class TTSRLModel(pl.LightningModule):
         mel_post_loss = F.mse_loss(mel_spectrogram_post, batch.mel_spectrogram)
         tts_loss = gate_loss + mel_loss + mel_post_loss
 
-        score_loss = F.mse_loss(tw_scores, tw_scores_pred)
+        score_loss = (tw_scores - tw_scores_pred).abs().mean(-1)
         val_loss = score_loss + tts_loss
 
         self.log(
