@@ -60,18 +60,20 @@ class RLGSTPolicy(nn.Module):
         deterministic: bool = False,
     ) -> Tuple[Tensor, Optional[Tensor], Optional[Tensor]]:
         """(batch, 768) → (batch, K) weights, (batch,) log_prob or None, (batch,) entropy or None."""
+        batch_size = bert_embeddings.shape[0]
+
         h = self.trunk(bert_embeddings)
-        mu = self.mu_head(h).reshape(-1, self.gst_heads, self.gst_token_num)
+        mu = self.mu_head(h).view(batch_size * self.gst_heads, self.gst_token_num)
         log_std = (
             self.log_std_head(h)
             .clamp(self.log_std_min, self.log_std_max)
-            .reshape(-1, self.gst_heads, self.gst_token_num)
+            .view(batch_size * self.gst_heads, self.gst_token_num)
         )
         std = torch.exp(log_std)
         dist = Normal(mu, std)
         z = dist.rsample()
-        log_probs = dist.log_prob(z).sum(dim=1)
-        entropy = dist.entropy().sum(dim=1)
+        log_probs = dist.log_prob(z)
+        entropy = dist.entropy()
 
         gst_weights = F.softmax(z / self.temperature, dim=1)
         return gst_weights, log_probs, entropy
