@@ -236,6 +236,11 @@ def main() -> None:
         help="Allowed characters for text normalization",
     )
     parser.add_argument("--max_len", type=int, default=None, help="Override max mel length")
+    parser.add_argument(
+        "--no_save_ref",
+        action="store_true",
+        help="Do not save original reference audio alongside generated clips.",
+    )
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir)
@@ -347,7 +352,7 @@ def main() -> None:
             sf.write(str(wav_path), wav_to_save.cpu().numpy(), 22050)
 
             # Save the original (reference) test wav alongside the generated wav when available.
-            if row and "wav" in row:
+            if not args.no_save_ref and row and "wav" in row:
                 try:
                     ref_wav_src = _resolve_wav_path(str(row["wav"]), base_dir)
                     ref_wav_dst = output_dir / f"{basename}_ref.wav"
