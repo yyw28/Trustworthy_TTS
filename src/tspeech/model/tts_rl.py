@@ -26,7 +26,7 @@ class TTSRLModel(pl.LightningModule):
         hubert_checkpoint_path: str,
         bert_model_name: str = "bert-base-uncased",
         hubert_model_name: str = "facebook/hubert-base-ls960",
-        rl_temperature: float = 1.0,
+        rl_temperature: float = 0.1,
         rl_entropy_coef: float = 0.01,
         save_audio_dir: Optional[str] = None,
         save_audio_every_n_steps: int = 100,
@@ -46,14 +46,14 @@ class TTSRLModel(pl.LightningModule):
         self.bert_gst_encoder = BERTEncoder(
             bert_model_name=bert_model_name,
             freeze_bert=True,
-        )
+        ) #(batch_size, 1024)
 
         # RL policy over GST token weights, driven by BERT embeddings.
         self.rl_policy = RLGSTPolicy(
             bert_hidden_size=self.bert_gst_encoder.bert.config.hidden_size,
             gst_token_num=10,
             temperature=rl_temperature,
-        )
+        ) #gst_weights: (batch_size * gst_heads, gst_token_num), log_probs: (batch_size * gst_heads, gst_token_num), entropy: (batch_size * gst_heads, gst_token_num)
 
         # HuBERT trustworthiness classifier (frozen).
         self.tw_classifier = HTModel.load_from_checkpoint(
@@ -63,7 +63,7 @@ class TTSRLModel(pl.LightningModule):
         )
         for p in self.tw_classifier.parameters():
             p.requires_grad = False
-        self.tw_classifier.eval()
+        self.tw_classifier.eval() #(batch_size, T_frames)
 
         # Vocoder for converting mels to waveforms during RL scoring.
         # Required for RL training (used to generate waveforms for HuBERT scoring).
@@ -126,19 +126,20 @@ class TTSRLModel(pl.LightningModule):
         bert_embeddings = self.bert_gst_encoder(score=tw_scores, text=batch.text)
         gst_weights, log_probs, entropy = self.rl_policy(
             bert_embeddings, deterministic=not self.training
-        )
+        ) #gst_weights: (batch_size * gst_heads, gst_token_num), log_probs: (batch_size * gst_heads, gst_token_num), entropy: (batch_size * gst_heads, gst_token_num)
 
         style = torch.bmm(
             gst_weights.unsqueeze(1),
             torch.tanh(self.tts.gst.stl.embed)[None, :, :].expand(
                 batch_size * self.tts.gst.stl.num_heads, -1, -1
-            ),
+            ), #(batch_size * gst_heads, 1, 256//8=32)
         )
         style = (
             style.transpose(0, 1)
             .view(batch_size, self.tts.gst.stl.token_embedding_size)
-        )
-        style = self.tts.gst.stl.attention.out_proj(style).unsqueeze(1)
+        ) #(batch_size, gst_token_embedding_size): (B, 32*8=256)
+        #because style embedding from tacotron2 is (batch_size, gst_token_embedding_size): (B, 256)
+        style = self.tts.gst.stl.attention.out_proj(style).unsqueeze(1) #(batch_size, 1, gst_token_embedding_size): (B, 1, 256)
 
         with torch.no_grad():
             mel_spectrogram, mel_spectrogram_post, gate, _ = self(
@@ -151,8 +152,12 @@ class TTSRLModel(pl.LightningModule):
                 mel_spectrogram_len=batch.mel_spectrogram_len,
                 style=style,
             )
+            #mel_spectrogram: (batch_size, T_frames, 80)
+            #mel_spectrogram_post: (batch_size, T_frames, 80)
+            #gate: (batch_size, T_frames, 1)
+            #_alignment: (batch_size, T_frames, T_chars)
 
-            wav_pred = self.vocoder(mel_spectrogram_post)
+            wav_pred = self.vocoder(mel_spectrogram_post) #(batch_size, T_pred)
             seq_len_pred = wav_pred.shape[1]
 
             pred_wav_lengths = (gate.squeeze(-1) < 0).int().argmax(axis=1)
@@ -163,22 +168,28 @@ class TTSRLModel(pl.LightningModule):
             # Multiply by 256 to calculate final wav output
             pred_wav_lengths *= 256
 
-            time_pred = torch.arange(seq_len_pred, device=self.device)[
-                None, :
-            ]  # (1, T')
+            time_pred = torch.arange(seq_len_pred, device=self.device)[None, :]  # (1, T')
             mask_pred = time_pred < pred_wav_lengths[:, None]  # (B, T')
             tw_scores_pred = torch.sigmoid(
                 self.tw_classifier(wav=wav_pred, mask=mask_pred)
-            ).squeeze(-1)
+            ).squeeze(-1) #(batch_size,): (B,)
 
-        gate_loss = F.binary_cross_entropy_with_logits(gate, batch.gate)
-        mel_loss = F.mse_loss(mel_spectrogram, batch.mel_spectrogram)
-        mel_post_loss = F.mse_loss(mel_spectrogram_post, batch.mel_spectrogram)
-        tts_loss = gate_loss + mel_loss + mel_post_loss
+        # Per-sample TTS losses: reduce over time/mel dims, keep batch dim
+        #gate_loss = F.binary_cross_entropy_with_logits(gate, batch.gate) #across the whole batch and all time steps
+        gate_loss = F.binary_cross_entropy_with_logits(gate, batch.gate, reduction="none").mean(dim=(1, 2))
+        mel_loss = F.l1_loss(
+            mel_spectrogram, batch.mel_spectrogram, reduction="none"
+        ).mean(dim=(1, 2))
+        mel_post_loss = F.l1_loss(
+            mel_spectrogram_post, batch.mel_spectrogram, reduction="none"
+        ).mean(dim=(1, 2))
+        tts_loss = gate_loss + mel_loss + mel_post_loss  # (batch_size,)
 
-        score_loss = (tw_scores - tw_scores_pred).abs().mean(-1)
-        reward = -(score_loss + tts_loss)
-        reinforce_loss = (-log_probs.reshape(batch_size, -1) * reward.detach()).mean()
+        # Per-sample score loss (B,) and reward (B,)
+        score_loss = (tw_scores - tw_scores_pred).abs()  # (batch_size,)
+        reward = -(score_loss + tts_loss)  # (batch_size,)
+        log_prob_per_sample = log_probs.reshape(batch_size, -1).sum(dim=1)  # (batch_size,)
+        reinforce_loss = -(log_prob_per_sample * reward.detach()).mean()
         # entropy_bonus = self.rl_entropy_coef * entropy.mean()
 
         loss = reinforce_loss  # + entropy_bonus
@@ -261,14 +272,26 @@ class TTSRLModel(pl.LightningModule):
             batch_size=mel_spectrogram.shape[0],
         )
 
+        self.log(
+            "training_log_prob",
+            log_prob_per_sample.detach().mean(),
+            on_step=True,
+            on_epoch=True,
+            sync_dist=True,
+            batch_size=mel_spectrogram.shape[0],
+        )
+
+        self.log(
+            "training_log_prob_std",
+            log_prob_per_sample.detach().std(),
+            on_step=True,
+            on_epoch=True,
+            sync_dist=True,
+            batch_size=mel_spectrogram.shape[0],
+        )
         return loss
 
     def on_train_batch_end(self, outputs, batch, batch_idx: int) -> None:
-        """Log parameter histograms during training, at the same frequency as validation.
-
-        We log only on batches that trigger a validation check (controlled by ``val_check_interval``)
-        to keep overhead reasonable while still getting multiple snapshots per epoch.
-        """
         trainer = getattr(self, "trainer", None)
         if trainer is None or trainer.sanity_checking:
             return
@@ -284,7 +307,7 @@ class TTSRLModel(pl.LightningModule):
             return
 
         for tag, param in self.named_parameters():
-            if param.requires_grad and param.grad is not None:
+            if param.requires_grad:
                 grad = param.grad.detach().cpu()
                 #if grad.numel() > 0:
                     #grad_np = grad.numpy().ravel()

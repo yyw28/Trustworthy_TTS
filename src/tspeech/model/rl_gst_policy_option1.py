@@ -21,11 +21,11 @@ class RLGSTPolicy(nn.Module):
 
     def __init__(
         self,
-        bert_hidden_size: int = 768,
+        bert_hidden_size: int = 1024,
         gst_token_num: int = 10,
-        gst_heads: int = 8,
+        gst_heads: int = 8, #8 GST heads
         hidden_dim: int = 256,
-        temperature: float = 1.0,
+        temperature: float = 0.10,
         init_log_std: float = -0.5,
         log_std_min: float = -5.0,
         log_std_max: float = 2.0,
@@ -38,15 +38,15 @@ class RLGSTPolicy(nn.Module):
         self.log_std_max = log_std_max
 
         self.trunk = nn.Sequential(
-            nn.Linear(bert_hidden_size, hidden_dim * gst_heads),
+            nn.Linear(bert_hidden_size, hidden_dim * gst_heads), #[1024, 256*8]
             nn.ReLU(),
             nn.Dropout(0.1),
-            nn.Linear(hidden_dim * gst_heads, hidden_dim * gst_heads),
+            nn.Linear(hidden_dim * gst_heads, hidden_dim * gst_heads), #[256*8, 256*8]
             nn.ReLU(),
             nn.Dropout(0.1),
         )
-        self.mu_head = nn.Linear(hidden_dim * gst_heads, gst_token_num * gst_heads)
-        self.log_std_head = nn.Linear(hidden_dim * gst_heads, gst_token_num * gst_heads)
+        self.mu_head = nn.Linear(hidden_dim * gst_heads, gst_token_num * gst_heads) #[256*8, 10*8]
+        self.log_std_head = nn.Linear(hidden_dim * gst_heads, gst_token_num * gst_heads) #[256*8, 10*8]
 
         for m in self.modules():
             if isinstance(m, nn.Linear):
@@ -54,28 +54,22 @@ class RLGSTPolicy(nn.Module):
                 nn.init.zeros_(m.bias)
         nn.init.constant_(self.log_std_head.bias, init_log_std)
 
-    def forward(
-        self,
-        bert_embeddings: Tensor,
-        deterministic: bool = False,
-    ) -> Tuple[Tensor, Optional[Tensor], Optional[Tensor]]:
-        """(batch, 768) → (batch, K) weights, (batch,) log_prob or None, (batch,) entropy or None."""
+    def forward(self,bert_embeddings: Tensor):
         batch_size = bert_embeddings.shape[0]
-
-        h = self.trunk(bert_embeddings)
-        mu = self.mu_head(h).view(batch_size * self.gst_heads, self.gst_token_num)
+        h = self.trunk(bert_embeddings) #[batch_size, 1024] -> [batch_size, 256*8]
+        mu = self.mu_head(h).view(batch_size * self.gst_heads, self.gst_token_num) #[batch_size, 256*8] -> [batch_size*8, 10]
         log_std = (
             self.log_std_head(h)
             .clamp(self.log_std_min, self.log_std_max)
-            .view(batch_size * self.gst_heads, self.gst_token_num)
+            .view(batch_size * self.gst_heads, self.gst_token_num) #[batch_size, 256*8] -> [batch_size*8, 10]
         )
-        std = torch.exp(log_std)
-        dist = Normal(mu, std)
-        z = dist.rsample()
-        log_probs = dist.log_prob(z)
-        entropy = dist.entropy()
+        std = torch.exp(log_std) #[batch_size*8, 10] -> [batch_size*8, 10]
+        dist = Normal(mu, std) #[batch_size*8, 10] -> [batch_size*8, 10]
+        z = dist.rsample() #[batch_size*8, 10] -> [batch_size*8, 10]
+        log_probs = dist.log_prob(z) #[batch_size*8, 10] -> [batch_size*8, 10]
+        entropy = dist.entropy() #[batch_size*8, 10] -> [batch_size*8, 10]
 
-        gst_weights = F.softmax(z / self.temperature, dim=1)
+        gst_weights = F.softmax(z / self.temperature, dim=1) #[batch_size*8, 10] -> [batch_size*8, 10]
         return gst_weights, log_probs, entropy
 
     # def get_log_probs(self, bert_embeddings: Tensor, z: Tensor) -> Tensor:
