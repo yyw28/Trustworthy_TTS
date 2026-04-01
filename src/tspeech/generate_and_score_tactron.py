@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-Generate audio with a Tacotron2+GST checkpoint (style from a reference wav),
-then vocode with HiFi-GAN.
+Generate audio with Tacotron2+GST and HiFi-GAN (style from a reference wav).
 
-- No HuBERT scoring
-- No 16 kHz conversion
-- When using --libritts_csv, outputs are saved in ONE folder with '/' replaced by '_'
+- Batched inference (--batch_size) for faster GPU generation
+- Optional HuBERT trustworthiness scoring (--hubert_checkpoint); writes scores.json
+- With --libritts_csv, output filenames mirror wav paths with '/' -> '_'
+
+Modeled after ``say.ipynb``.
 """
 
 import argparse
@@ -24,1031 +25,12 @@ import tspeech._torchvision_first  # noqa: F401
 import soundfile as sf
 import torch
 import torchaudio
-from torch.nn import functional as F
-
-from tspeech.model.tacotron2.hifi_gan import Generator
-from tspeech.model.tts import TTSModel
-
-
-class AttrDict(dict):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.__dict__ = self
-
-
-class LibriTTSRow(TypedDict, total=False):
-    wav: str
-    speaker_id: str
-    text: str
-    duration: str
-    speaker_idx: str
-
-
-def _normalize_text(text: str, allowed_chars: str) -> str:
-    allowed = set(allowed_chars)
-    return "".join(ch for ch in text.lower() if ch in allowed)
-
-
-def _build_char_to_id_from_texts(texts: list[str], end_token: str) -> dict[str, int]:
-    chars_set: set[str] = set()
-    for t in texts:
-        chars_set.update(t)
-    chars_set.add(end_token)
-    chars = sorted(chars_set)
-    return {ch: i + 1 for i, ch in enumerate(chars)}  # 0 reserved for padding
-
-
-def _encode(char_to_id: dict[str, int], text: str, end_token: str, device: torch.device):
-    ids = [char_to_id[ch] for ch in (text + end_token)]
-    x = torch.tensor(ids, dtype=torch.int64, device=device).unsqueeze(0)  # (1, T)
-    x_len = torch.tensor([x.shape[1]], dtype=torch.int64, device=device)
-    return x, x_len
-
-
-def _mel_spectrogram(wav: torch.Tensor, sr: int, n_mels: int) -> torch.Tensor:
-    melspec = torchaudio.transforms.MelSpectrogram(
-        sample_rate=sr,
-        n_fft=1024,
-        win_length=1024,
-        hop_length=256,
-        f_min=0.0,
-        f_max=8000.0,
-        n_mels=n_mels,
-        power=1.0,
-        mel_scale="slaney",
-        norm="slaney",
-        center=True,
-    )(wav)
-    return torch.log(torch.clamp(melspec, min=1e-5)).transpose(0, 1)
-
-
-def _waveform_undo_mel_time_scale(wav: torch.Tensor, mel_time_scale: float) -> torch.Tensor:
-    """Invert mel time-axis stretch on vocoder output; same convention as ``TTSRLModel._waveform_for_hubert``."""
-    if wav.dim() == 1:
-        wav = wav.unsqueeze(0)
-    s = float(mel_time_scale)
-    if abs(s - 1.0) <= 1e-6:
-        return wav
-    return F.interpolate(
-        wav.unsqueeze(1),
-        scale_factor=float(1.0 / s),
-        mode="linear",
-        align_corners=False,
-    ).squeeze(1)
-
-
-def _hubert_valid_samples_after_undo(n_scaled: int, mel_time_scale: float, undo_len: int) -> int:
-    s = float(mel_time_scale)
-    if abs(s - 1.0) <= 1e-6:
-        n_undo = n_scaled
-    else:
-        n_undo = int(round(n_scaled / s))
-    return max(1, min(n_undo, undo_len))
-
-
-def _read_libritts_pipe_csv(path: Path) -> list[LibriTTSRow]:
-    rows: list[LibriTTSRow] = []
-    for line in path.read_text().splitlines():
-        if not line.strip():
-            continue
-        if line.lower().startswith("wav|"):
-            continue
-        parts = line.split("|")
-        if len(parts) < 5:
-            continue
-        wav, speaker_id, text, duration, speaker_idx = parts[:5]
-        rows.append(
-            {
-                "wav": wav.strip(),
-                "speaker_id": speaker_id.strip(),
-                "text": text.strip().strip('"'),
-                "duration": duration.strip(),
-                "speaker_idx": speaker_idx.strip(),
-            }
-        )
-    return rows
-
-
-def _resolve_wav_path(wav_path: str, base_dir: Optional[Path]) -> Path:
-    p = Path(wav_path)
-    if p.is_absolute():
-        return p
-    if base_dir is None:
-        raise ValueError("Relative wav paths require --libritts_dir")
-    return base_dir / p
-
-
-def _load_hifigan_generator(checkpoint_dir: str, device: torch.device) -> Generator:
-    ckpt_dir = Path(checkpoint_dir)
-    config_path = ckpt_dir / "config.json"
-    if not config_path.is_file():
-        raise FileNotFoundError(f"Missing HiFi-GAN config: {config_path}")
-
-    config = AttrDict(json.loads(config_path.read_text()))
-    generator_files = sorted(ckpt_dir.glob("g_*"))
-    if not generator_files:
-        raise FileNotFoundError(f"No HiFi-GAN generator checkpoint (g_*) found in {ckpt_dir}")
-    generator_path = generator_files[0]
-
-    generator = Generator(config)
-    state = torch.load(generator_path, map_location="cpu")
-    state_dict = state["generator"] if isinstance(state, dict) and "generator" in state else state
-    generator.load_state_dict(state_dict, strict=False)
-    generator.remove_weight_norm()
-    return generator.to(device).eval()
-
-
-def main() -> None:
-    p = argparse.ArgumentParser(description="Generate Tacotron2+GST samples (no HuBERT, no 16k conversion)")
-    p.add_argument("--checkpoint", required=True, help="Tacotron+GST checkpoint (.ckpt)")
-    p.add_argument("--vocoder_checkpoint_dir", required=True, help="HiFi-GAN checkpoint dir (UNIVERSAL_V1)")
-
-    p.add_argument("--libritts_dir", default="/workplace/LibriTTS", help="Base directory for LibriTTS wav paths")
-    p.add_argument("--libritts_csv", default=None, help="LibriTTS CSV: wav|speaker_id|text|duration|speaker_idx")
-
-    p.add_argument("--style_wav", default=None, help="Reference wav for GST style (abs or relative to --libritts_dir)")
-    p.add_argument("--style_sr", type=int, default=22050, help="Sample rate used to load style_wav")
-
-    p.add_argument("--text", action="append", default=None, help="Text to synthesize (repeatable)")
-    p.add_argument("--texts_file", default=None, help="Text file (one line per text)")
-    p.add_argument("--output_dir", default="./tacotron_gst_test_audio")
-    p.add_argument("--limit", type=int, default=None, help="If set, only synthesize the first N items")
-
-    p.add_argument("--speaker_idx", type=int, default=0)
-    p.add_argument("--end_token", default="^")
-    p.add_argument("--allowed_chars", default="!'(),.:;? \\-abcdefghijklmnopqrstuvwxyz")
-    p.add_argument("--max_len", type=int, default=800)
-    p.add_argument("--mel_time_scale", type=float, default=1.0, help="Time-scale mel axis before HiFi-GAN (optional)")
-
-    p.add_argument("--sample_rate", type=int, default=22050, help="Sample rate to save generated wavs")
-    p.add_argument("--device", default="auto", help="auto/cuda/cpu")
-    args = p.parse_args()
-
-    out_dir = Path(args.output_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    base_dir = Path(args.libritts_dir) if args.libritts_dir else None
-    rows: list[LibriTTSRow] = []
-    texts: list[str] = []
-    if args.libritts_csv:
-        rows = _read_libritts_pipe_csv(Path(args.libritts_csv))
-        texts = [r["text"] for r in rows if r.get("text")]
-    else:
-        if args.text:
-            texts.extend([t.strip() for t in args.text if t.strip()])
-        if args.texts_file:
-            texts.extend([t.strip() for t in Path(args.texts_file).read_text().splitlines() if t.strip()])
-
-    if not texts:
-        raise ValueError("Provide --text/--texts_file or --libritts_csv")
-
-    if args.limit is not None and int(args.limit) > 0:
-        n_lim = int(args.limit)
-        texts = texts[:n_lim]
-        if rows:
-            rows = rows[:n_lim]
-
-    texts = [_normalize_text(t, args.allowed_chars) for t in texts]
-    char_to_id = _build_char_to_id_from_texts(texts, args.end_token)
-
-    device = (
-        torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        if args.device == "auto"
-        else torch.device(args.device)
-    )
-
-    model = TTSModel.load_from_checkpoint(args.checkpoint, map_location="cpu").to(device).eval()
-    if model.gst is None:
-        raise ValueError("Loaded checkpoint has gst disabled (model.gst is None).")
-
-    tacotron = model.tacotron2
-    gst = model.gst
-    n_mels = int(model.hparams["num_mels"])
-    num_chars = int(model.hparams["num_chars"])
-    speaker_count = int(model.hparams.get("speaker_count", 1))
-
-    max_id = max(char_to_id.values())
-    if max_id >= num_chars:
-        raise ValueError(
-            f"Text encoder produced id {max_id} but model.num_chars={num_chars}. "
-            "Adjust --allowed_chars / normalization so vocab matches the checkpoint."
-        )
-
-    generator = _load_hifigan_generator(args.vocoder_checkpoint_dir, device=device)
-
-    # Style embedding from reference wav
-    style_wav_path: Optional[str] = args.style_wav
-    if style_wav_path is None:
-        if not rows:
-            raise ValueError("--style_wav is required unless --libritts_csv is provided")
-        style_wav_path = rows[0].get("wav")
-        if not style_wav_path:
-            raise ValueError("Could not pick a style wav from --libritts_csv; pass --style_wav explicitly")
-
-    style_wav_abs = _resolve_wav_path(str(style_wav_path), base_dir)
-    audio_np, sr = sf.read(str(style_wav_abs), dtype="float32", always_2d=True)  # (T, C)
-    style_wav = torch.from_numpy(audio_np).transpose(0, 1)  # (C, T)
-    if style_wav.shape[0] > 1:
-        style_wav = style_wav.mean(dim=0, keepdim=True)
-    if sr != int(args.style_sr):
-        style_wav = torchaudio.transforms.Resample(orig_freq=sr, new_freq=int(args.style_sr))(style_wav)
-        sr = int(args.style_sr)
-    style_wav = style_wav.squeeze(0)  # (T,)
-
-    style_mel = _mel_spectrogram(style_wav, sr=sr, n_mels=n_mels).unsqueeze(0).to(device)  # (1, T, n_mels)
-    style_mel_len = torch.tensor([style_mel.shape[1]], dtype=torch.int64, device=device)
-    style = gst(style_mel, style_mel_len)
-
-    def _out_name(i: int) -> str:
-        if i < len(rows) and rows[i].get("wav"):
-            ref_wav_str = str(rows[i]["wav"])
-            name = ref_wav_str.replace("\\", "_").replace("/", "_")
-            return name if name.lower().endswith(".wav") else (name + ".wav")
-        return f"sample_{i:03d}.wav"
-
-    mel_time_scale = float(args.mel_time_scale)
-
-    with torch.inference_mode():
-        for i, text in enumerate(texts):
-            sp = int(args.speaker_idx)
-            if i < len(rows) and rows[i].get("speaker_idx"):
-                sp = int(rows[i]["speaker_idx"])
-            if sp < 0 or sp >= speaker_count:
-                sp = 0
-            speaker = torch.tensor([sp], dtype=torch.int64, device=device)
-
-            x, x_len = _encode(char_to_id, text, args.end_token, device)
-            _, mel_post, gate, _ = tacotron(
-                chars_idx=x,
-                chars_idx_len=x_len,
-                teacher_forcing_dropout=0.0,
-                teacher_forcing=False,
-                speaker_id=speaker,
-                max_len_override=int(args.max_len),
-                encoded_extra=style,
-            )
-
-            mel_b80t = mel_post.transpose(1, 2)  # (1, 80, T)
-            if abs(mel_time_scale - 1.0) > 1e-6:
-                mel_b80t = F.interpolate(
-                    mel_b80t,
-                    scale_factor=mel_time_scale,
-                    mode="linear",
-                    align_corners=False,
-                )
-
-            wav = generator(mel_b80t)
-            if wav.dim() == 3:
-                wav = wav.squeeze(1)  # (1, samples)
-
-            gate_end = gate.squeeze(-1) < 0
-            has_end = gate_end.any(dim=1)
-            end_idx = gate_end.int().argmax(dim=1)
-            mel_frames = torch.where(has_end, end_idx + 1, torch.full_like(end_idx, gate.shape[1]))
-            pred_len = (mel_frames.float() * mel_time_scale).round().long() * 256
-            pred_len = pred_len.clamp(min=256, max=wav.shape[-1])
-
-            n = int(pred_len[0].item())
-            wav_0 = wav[0, :n].detach().cpu().numpy()
-            out_path = out_dir / _out_name(i)
-            sf.write(str(out_path), wav_0, int(args.sample_rate))
-
-    print(f"Saved {len(texts)} wavs to {out_dir}")
-
-
-if __name__ == "__main__":
-    main()
-
-#!/usr/bin/env python3
-"""
-Generate audio with a Tacotron2+GST checkpoint (style from a reference wav),
-then vocode with HiFi-GAN.
-
-- No HuBERT scoring
-- No 16 kHz conversion
-- When using --libritts_csv, outputs are saved in ONE folder with '/' replaced by '_'
-"""
-
-import argparse
-import json
-import sys
-from pathlib import Path
-from typing import Optional, TypedDict
-
-# Ensure local `src/` is on PYTHONPATH when running as a script.
-project_src = Path(__file__).resolve().parents[1]
-if str(project_src) not in sys.path:
-    sys.path.insert(0, str(project_src))
-
-import tspeech._torchvision_first  # noqa: F401
-
-import soundfile as sf
-import torch
-import torchaudio
-from torch.nn import functional as F
-
-from tspeech.model.tacotron2.hifi_gan import Generator
-from tspeech.model.tts import TTSModel
-
-
-class AttrDict(dict):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.__dict__ = self
-
-
-class LibriTTSRow(TypedDict, total=False):
-    wav: str
-    speaker_id: str
-    text: str
-    duration: str
-    speaker_idx: str
-
-
-def _normalize_text(text: str, allowed_chars: str) -> str:
-    allowed = set(allowed_chars)
-    return "".join(ch for ch in text.lower() if ch in allowed)
-
-
-def _build_char_to_id_from_texts(texts: list[str], end_token: str) -> dict[str, int]:
-    chars_set: set[str] = set()
-    for t in texts:
-        chars_set.update(t)
-    chars_set.add(end_token)
-    chars = sorted(chars_set)
-    return {ch: i + 1 for i, ch in enumerate(chars)}  # 0 reserved for padding
-
-
-def _encode(char_to_id: dict[str, int], text: str, end_token: str, device: torch.device):
-    ids = [char_to_id[ch] for ch in (text + end_token)]
-    x = torch.tensor(ids, dtype=torch.int64, device=device).unsqueeze(0)  # (1, T)
-    x_len = torch.tensor([x.shape[1]], dtype=torch.int64, device=device)
-    return x, x_len
-
-
-def _mel_spectrogram(wav: torch.Tensor, sr: int, n_mels: int) -> torch.Tensor:
-    melspec = torchaudio.transforms.MelSpectrogram(
-        sample_rate=sr,
-        n_fft=1024,
-        win_length=1024,
-        hop_length=256,
-        f_min=0.0,
-        f_max=8000.0,
-        n_mels=n_mels,
-        power=1.0,
-        mel_scale="slaney",
-        norm="slaney",
-        center=True,
-    )(wav)
-    return torch.log(torch.clamp(melspec, min=1e-5)).transpose(0, 1)
-
-
-def _waveform_undo_mel_time_scale(wav: torch.Tensor, mel_time_scale: float) -> torch.Tensor:
-    """Invert mel time-axis stretch on vocoder output; same convention as ``TTSRLModel._waveform_for_hubert``."""
-    if wav.dim() == 1:
-        wav = wav.unsqueeze(0)
-    s = float(mel_time_scale)
-    if abs(s - 1.0) <= 1e-6:
-        return wav
-    return F.interpolate(
-        wav.unsqueeze(1),
-        scale_factor=float(1.0 / s),
-        mode="linear",
-        align_corners=False,
-    ).squeeze(1)
-
-
-def _hubert_valid_samples_after_undo(n_scaled: int, mel_time_scale: float, undo_len: int) -> int:
-    s = float(mel_time_scale)
-    if abs(s - 1.0) <= 1e-6:
-        n_undo = n_scaled
-    else:
-        n_undo = int(round(n_scaled / s))
-    return max(1, min(n_undo, undo_len))
-
-
-def _read_libritts_pipe_csv(path: Path) -> list[LibriTTSRow]:
-    rows: list[LibriTTSRow] = []
-    for line in path.read_text().splitlines():
-        if not line.strip():
-            continue
-        if line.lower().startswith("wav|"):
-            continue
-        parts = line.split("|")
-        if len(parts) < 5:
-            continue
-        wav, speaker_id, text, duration, speaker_idx = parts[:5]
-        rows.append(
-            {
-                "wav": wav.strip(),
-                "speaker_id": speaker_id.strip(),
-                "text": text.strip().strip('"'),
-                "duration": duration.strip(),
-                "speaker_idx": speaker_idx.strip(),
-            }
-        )
-    return rows
-
-
-def _resolve_wav_path(wav_path: str, base_dir: Optional[Path]) -> Path:
-    p = Path(wav_path)
-    if p.is_absolute():
-        return p
-    if base_dir is None:
-        raise ValueError("Relative wav paths require --libritts_dir")
-    return base_dir / p
-
-
-def _load_hifigan_generator(checkpoint_dir: str, device: torch.device) -> Generator:
-    ckpt_dir = Path(checkpoint_dir)
-    config_path = ckpt_dir / "config.json"
-    if not config_path.is_file():
-        raise FileNotFoundError(f"Missing HiFi-GAN config: {config_path}")
-
-    config = AttrDict(json.loads(config_path.read_text()))
-    generator_files = sorted(ckpt_dir.glob("g_*"))
-    if not generator_files:
-        raise FileNotFoundError(f"No HiFi-GAN generator checkpoint (g_*) found in {ckpt_dir}")
-    generator_path = generator_files[0]
-
-    generator = Generator(config)
-    state = torch.load(generator_path, map_location="cpu")
-    state_dict = state["generator"] if isinstance(state, dict) and "generator" in state else state
-    generator.load_state_dict(state_dict, strict=False)
-    generator.remove_weight_norm()
-    return generator.to(device).eval()
-
-
-def main() -> None:
-    p = argparse.ArgumentParser(description="Generate Tacotron2+GST samples (no HuBERT, no 16k conversion)")
-    p.add_argument("--checkpoint", required=True, help="Tacotron+GST checkpoint (.ckpt)")
-    p.add_argument("--vocoder_checkpoint_dir", required=True, help="HiFi-GAN checkpoint dir (UNIVERSAL_V1)")
-
-    p.add_argument("--libritts_dir", default="/workplace/LibriTTS", help="Base directory for LibriTTS wav paths")
-    p.add_argument("--libritts_csv", default=None, help="LibriTTS CSV: wav|speaker_id|text|duration|speaker_idx")
-
-    p.add_argument("--style_wav", default=None, help="Reference wav for GST style (abs or relative to --libritts_dir)")
-    p.add_argument("--style_sr", type=int, default=22050, help="Sample rate used to load style_wav")
-
-    p.add_argument("--text", action="append", default=None, help="Text to synthesize (repeatable)")
-    p.add_argument("--texts_file", default=None, help="Text file (one line per text)")
-    p.add_argument("--output_dir", default="./tacotron_gst_test_audio")
-    p.add_argument("--limit", type=int, default=None, help="If set, only synthesize the first N items")
-
-    p.add_argument("--speaker_idx", type=int, default=0)
-    p.add_argument("--end_token", default="^")
-    p.add_argument("--allowed_chars", default="!'(),.:;? \\-abcdefghijklmnopqrstuvwxyz")
-    p.add_argument("--max_len", type=int, default=800)
-    p.add_argument(
-        "--mel_time_scale",
-        type=float,
-        default=22050 / 16000,
-        help="Time-scale mel axis before HiFi-GAN (default 22050/16000)",
-    )
-
-    p.add_argument("--sample_rate", type=int, default=22050, help="Sample rate to save generated wavs")
-    p.add_argument("--device", default="auto", help="auto/cuda/cpu")
-    args = p.parse_args()
-
-    out_dir = Path(args.output_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    base_dir = Path(args.libritts_dir) if args.libritts_dir else None
-    rows: list[LibriTTSRow] = []
-    texts: list[str] = []
-    if args.libritts_csv:
-        rows = _read_libritts_pipe_csv(Path(args.libritts_csv))
-        texts = [r["text"] for r in rows if r.get("text")]
-    else:
-        if args.text:
-            texts.extend([t.strip() for t in args.text if t.strip()])
-        if args.texts_file:
-            texts.extend([t.strip() for t in Path(args.texts_file).read_text().splitlines() if t.strip()])
-
-    if not texts:
-        raise ValueError("Provide --text/--texts_file or --libritts_csv")
-
-    if args.limit is not None and int(args.limit) > 0:
-        n_lim = int(args.limit)
-        texts = texts[:n_lim]
-        if rows:
-            rows = rows[:n_lim]
-
-    texts = [_normalize_text(t, args.allowed_chars) for t in texts]
-    char_to_id = _build_char_to_id_from_texts(texts, args.end_token)
-
-    device = (
-        torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        if args.device == "auto"
-        else torch.device(args.device)
-    )
-
-    model = TTSModel.load_from_checkpoint(args.checkpoint, map_location="cpu").to(device).eval()
-    if model.gst is None:
-        raise ValueError("Loaded checkpoint has gst disabled (model.gst is None).")
-
-    tacotron = model.tacotron2
-    gst = model.gst
-    n_mels = int(model.hparams["num_mels"])
-    num_chars = int(model.hparams["num_chars"])
-    speaker_count = int(model.hparams.get("speaker_count", 1))
-
-    max_id = max(char_to_id.values())
-    if max_id >= num_chars:
-        raise ValueError(
-            f"Text encoder produced id {max_id} but model.num_chars={num_chars}. "
-            "Adjust --allowed_chars / normalization so vocab matches the checkpoint."
-        )
-
-    generator = _load_hifigan_generator(args.vocoder_checkpoint_dir, device=device)
-
-    style_wav_path: Optional[str] = args.style_wav
-    if style_wav_path is None:
-        if not rows:
-            raise ValueError("--style_wav is required unless --libritts_csv is provided")
-        style_wav_path = rows[0].get("wav")
-        if not style_wav_path:
-            raise ValueError("Could not pick a style wav from --libritts_csv; pass --style_wav explicitly")
-
-    style_wav_abs = _resolve_wav_path(str(style_wav_path), base_dir)
-    audio_np, sr = sf.read(str(style_wav_abs), dtype="float32", always_2d=True)  # (T, C)
-    style_wav = torch.from_numpy(audio_np).transpose(0, 1)  # (C, T)
-    if style_wav.shape[0] > 1:
-        style_wav = style_wav.mean(dim=0, keepdim=True)
-    if sr != int(args.style_sr):
-        style_wav = torchaudio.transforms.Resample(orig_freq=sr, new_freq=int(args.style_sr))(style_wav)
-        sr = int(args.style_sr)
-    style_wav = style_wav.squeeze(0)  # (T,)
-
-    style_mel = _mel_spectrogram(style_wav, sr=sr, n_mels=n_mels).unsqueeze(0).to(device)  # (1, T, n_mels)
-    style_mel_len = torch.tensor([style_mel.shape[1]], dtype=torch.int64, device=device)
-    style = gst(style_mel, style_mel_len)
-
-    def _out_name(i: int) -> str:
-        if i < len(rows) and rows[i].get("wav"):
-            ref_wav_str = str(rows[i]["wav"])
-            name = ref_wav_str.replace("\\", "_").replace("/", "_")
-            return name if name.lower().endswith(".wav") else (name + ".wav")
-        return f"sample_{i:03d}.wav"
-
-    mel_time_scale = float(args.mel_time_scale)
-
-    with torch.inference_mode():
-        for i, text in enumerate(texts):
-            sp = int(args.speaker_idx)
-            if i < len(rows) and rows[i].get("speaker_idx"):
-                sp = int(rows[i]["speaker_idx"])
-            if sp < 0 or sp >= speaker_count:
-                sp = 0
-            speaker = torch.tensor([sp], dtype=torch.int64, device=device)
-
-            x, x_len = _encode(char_to_id, text, args.end_token, device)
-            _, mel_post, gate, _ = tacotron(
-                chars_idx=x,
-                chars_idx_len=x_len,
-                teacher_forcing_dropout=0.0,
-                teacher_forcing=False,
-                speaker_id=speaker,
-                max_len_override=int(args.max_len),
-                encoded_extra=style,
-            )
-
-            mel_b80t = mel_post.transpose(1, 2)  # (1, 80, T)
-            if abs(mel_time_scale - 1.0) > 1e-6:
-                mel_b80t = F.interpolate(
-                    mel_b80t,
-                    scale_factor=mel_time_scale,
-                    mode="linear",
-                    align_corners=False,
-                )
-
-            wav = generator(mel_b80t)
-            if wav.dim() == 3:
-                wav = wav.squeeze(1)  # (1, samples)
-
-            gate_end = gate.squeeze(-1) < 0
-            has_end = gate_end.any(dim=1)
-            end_idx = gate_end.int().argmax(dim=1)
-            mel_frames = torch.where(has_end, end_idx + 1, torch.full_like(end_idx, gate.shape[1]))
-            pred_len = (mel_frames.float() * mel_time_scale).round().long() * 256
-            pred_len = pred_len.clamp(min=256, max=wav.shape[-1])
-
-            n = int(pred_len[0].item())
-            wav_0 = wav[0, :n].detach().cpu().numpy()
-            out_path = out_dir / _out_name(i)
-            sf.write(str(out_path), wav_0, int(args.sample_rate))
-
-    print(f"Saved {len(texts)} wavs to {out_dir}")
-
-
-if __name__ == "__main__":
-    main()
-
-#!/usr/bin/env python3
-"""
-Generate test audio with a Tacotron2+GST checkpoint (style from a reference wav).
-
-This is a lightweight inference script modeled after `say.ipynb`.
-"""
-
-import argparse
-import json
-import sys
-from pathlib import Path
-from typing import Optional, TypedDict
-
-# Ensure local `src/` is on PYTHONPATH when running as a script.
-project_src = Path(__file__).resolve().parents[1]
-if str(project_src) not in sys.path:
-    sys.path.insert(0, str(project_src))
-
-import tspeech._torchvision_first  # noqa: F401
-
-import soundfile as sf
-import torch
-import torchaudio
-from torch.nn import functional as F
-
-from tspeech.model.tacotron2.hifi_gan import Generator
-from tspeech.model.tts import TTSModel
-
-
-class AttrDict(dict):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.__dict__ = self
-
-
-class LibriTTSRow(TypedDict, total=False):
-    wav: str
-    speaker_id: str
-    text: str
-    duration: str
-    speaker_idx: str
-
-
-def _normalize_text(text: str, allowed_chars: str) -> str:
-    allowed = set(allowed_chars)
-    return "".join(ch for ch in text.lower() if ch in allowed)
-
-
-def _build_char_to_id_from_texts(texts: list[str], end_token: str) -> dict[str, int]:
-    chars_set: set[str] = set()
-    for t in texts:
-        chars_set.update(t)
-    chars_set.add(end_token)
-    chars = sorted(chars_set)
-    return {ch: i + 1 for i, ch in enumerate(chars)}  # 0 reserved for padding
-
-
-def _encode(char_to_id: dict[str, int], text: str, end_token: str, device: torch.device):
-    ids = [char_to_id[ch] for ch in (text + end_token)]
-    x = torch.tensor(ids, dtype=torch.int64, device=device).unsqueeze(0)
-    x_len = torch.tensor([x.shape[1]], dtype=torch.int64, device=device)
-    return x, x_len
-
-
-def _mel_spectrogram(wav: torch.Tensor, sr: int, n_mels: int) -> torch.Tensor:
-    melspec = torchaudio.transforms.MelSpectrogram(
-        sample_rate=sr,
-        n_fft=1024,
-        win_length=1024,
-        hop_length=256,
-        f_min=0.0,
-        f_max=8000.0,
-        n_mels=n_mels,
-        power=1.0,
-        mel_scale="slaney",
-        norm="slaney",
-        center=True,
-    )(wav)
-    return torch.log(torch.clamp(melspec, min=1e-5)).transpose(0, 1)
-
-
-def _waveform_undo_mel_time_scale(wav: torch.Tensor, mel_time_scale: float) -> torch.Tensor:
-    """Invert mel time-axis stretch on vocoder output; same convention as ``TTSRLModel._waveform_for_hubert``."""
-    if wav.dim() == 1:
-        wav = wav.unsqueeze(0)
-    s = float(mel_time_scale)
-    if abs(s - 1.0) <= 1e-6:
-        return wav
-    return F.interpolate(
-        wav.unsqueeze(1),
-        scale_factor=float(1.0 / s),
-        mode="linear",
-        align_corners=False,
-    ).squeeze(1)
-
-
-def _hubert_valid_samples_after_undo(n_scaled: int, mel_time_scale: float, undo_len: int) -> int:
-    s = float(mel_time_scale)
-    if abs(s - 1.0) <= 1e-6:
-        n_undo = n_scaled
-    else:
-        n_undo = int(round(n_scaled / s))
-    return max(1, min(n_undo, undo_len))
-
-
-def _read_libritts_pipe_csv(path: Path) -> list[LibriTTSRow]:
-    rows: list[LibriTTSRow] = []
-    for line in path.read_text().splitlines():
-        if not line.strip():
-            continue
-        if line.lower().startswith("wav|"):
-            continue
-        parts = line.split("|")
-        if len(parts) < 5:
-            continue
-        wav, speaker_id, text, duration, speaker_idx = parts[:5]
-        rows.append(
-            {
-                "wav": wav.strip(),
-                "speaker_id": speaker_id.strip(),
-                "text": text.strip().strip('"'),
-                "duration": duration.strip(),
-                "speaker_idx": speaker_idx.strip(),
-            }
-        )
-    return rows
-
-
-def _resolve_wav_path(wav_path: str, base_dir: Optional[Path]) -> Path:
-    p = Path(wav_path)
-    if p.is_absolute():
-        return p
-    if base_dir is None:
-        raise ValueError("Relative wav paths require --libritts_dir")
-    return base_dir / p
-
-
-def _load_hifigan_generator(checkpoint_dir: str, device: torch.device) -> Generator:
-    ckpt_dir = Path(checkpoint_dir)
-    config_path = ckpt_dir / "config.json"
-    if not config_path.is_file():
-        raise FileNotFoundError(f"Missing HiFi-GAN config: {config_path}")
-
-    config = AttrDict(json.loads(config_path.read_text()))
-    generator_files = sorted(ckpt_dir.glob("g_*"))
-    if not generator_files:
-        raise FileNotFoundError(f"No HiFi-GAN generator checkpoint (g_*) found in {ckpt_dir}")
-    generator_path = generator_files[0]
-
-    generator = Generator(config)
-    state = torch.load(generator_path, map_location="cpu")
-    state_dict = state["generator"] if isinstance(state, dict) and "generator" in state else state
-    generator.load_state_dict(state_dict, strict=False)
-    generator.remove_weight_norm()
-    return generator.to(device).eval()
-
-
-def main() -> None:
-    p = argparse.ArgumentParser(description="Generate test samples with Tacotron2+GST checkpoint")
-    p.add_argument("--checkpoint", required=True, help="Tacotron+GST checkpoint, e.g. checkpoint-epoch=85-....ckpt")
-    p.add_argument("--vocoder_checkpoint_dir", required=True, help="HiFi-GAN checkpoint dir (UNIVERSAL_V1)")
-    p.add_argument("--hubert_checkpoint", default=None, help="Optional HuBERT trustworthiness checkpoint to score generated audio")
-
-    p.add_argument("--libritts_dir", default="/workplace/LibriTTS", help="Base directory for LibriTTS wav paths")
-    p.add_argument("--libritts_csv", default=None, help="Optional LibriTTS CSV: wav|speaker_id|text|duration|speaker_idx")
-
-    p.add_argument("--style_wav", default=None, help="Reference wav to compute GST style from (absolute or relative to --libritts_dir)")
-    p.add_argument("--style_sr", type=int, default=22050, help="Sample rate used to load style_wav")
-
-    p.add_argument("--text", action="append", default=None, help="Text to synthesize (repeatable)")
-    p.add_argument("--texts_file", default=None, help="Text file (one line per text)")
-    p.add_argument("--output_dir", default="./tacotron_gst_test_audio")
-    p.add_argument("--limit", type=int, default=None, help="If set, only synthesize the first N items")
-
-    p.add_argument("--speaker_idx", type=int, default=0)
-    p.add_argument("--end_token", default="^")
-    p.add_argument("--allowed_chars", default="!'(),.:;? \\-abcdefghijklmnopqrstuvwxyz")
-    p.add_argument("--max_len", type=int, default=800)
-    p.add_argument(
-        "--mel_time_scale",
-        type=float,
-        default=22050 / 16000,
-        help="Time-scale mel before HiFi-GAN (default 22050/16000; matches say.ipynb zoom-style stretch)",
-    )
-
-    p.add_argument("--sample_rate", type=int, default=22050, help="Wav sample rate to save at")
-    p.add_argument("--device", default="auto", help="auto/cuda/cpu")
-    args = p.parse_args()
-
-    out_dir = Path(args.output_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    base_dir = Path(args.libritts_dir) if args.libritts_dir else None
-    rows: list[LibriTTSRow] = []
-    texts: list[str] = []
-    if args.libritts_csv:
-        rows = _read_libritts_pipe_csv(Path(args.libritts_csv))
-        texts = [r["text"] for r in rows if r.get("text")]
-    else:
-        if args.text:
-            texts.extend([t.strip() for t in args.text if t.strip()])
-        if args.texts_file:
-            texts.extend([t.strip() for t in Path(args.texts_file).read_text().splitlines() if t.strip()])
-
-    if not texts:
-        raise ValueError("Provide --text/--texts_file or --libritts_csv")
-
-    if args.limit is not None:
-        n_lim = int(args.limit)
-        if n_lim > 0:
-            texts = texts[:n_lim]
-            if rows:
-                rows = rows[:n_lim]
-
-    texts = [_normalize_text(t, args.allowed_chars) for t in texts]
-    char_to_id = _build_char_to_id_from_texts(texts, args.end_token)
-
-    device = (
-        torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        if args.device == "auto"
-        else torch.device(args.device)
-    )
-
-    model = TTSModel.load_from_checkpoint(args.checkpoint, map_location="cpu").to(device).eval()
-    if model.gst is None:
-        raise ValueError("Loaded checkpoint has gst disabled (model.gst is None).")
-
-    tacotron = model.tacotron2
-    gst = model.gst
-    n_mels = int(model.hparams["num_mels"])
-    num_chars = int(model.hparams["num_chars"])
-    speaker_count = int(model.hparams.get("speaker_count", 1))
-
-    max_id = max(char_to_id.values())
-    if max_id >= num_chars:
-        raise ValueError(
-            f"Text encoder produced id {max_id} but model.num_chars={num_chars}. "
-            "Try adjusting --allowed_chars / normalization, or build the vocab from the same dataset used in training."
-        )
-
-    generator = _load_hifigan_generator(args.vocoder_checkpoint_dir, device=device)
-
-    hubert = None
-    resampler_to_16k = None
-    if args.hubert_checkpoint:
-        from tspeech.model.htmodel import HTModel
-
-        hubert = HTModel.load_from_checkpoint(
-            args.hubert_checkpoint,
-            map_location="cpu",
-            hubert_model_name="facebook/hubert-base-ls960",
-            trainable_layers=0,
-        ).to(device)
-        hubert.eval()
-        for p_ in hubert.parameters():
-            p_.requires_grad = False
-        resampler_to_16k = torchaudio.transforms.Resample(orig_freq=int(args.sample_rate), new_freq=16000).to(device)
-
-    scores: list[dict] = []
-
-    # Style embedding from reference wav
-    style_wav_path: Optional[str] = args.style_wav
-    if style_wav_path is None:
-        if not rows:
-            raise ValueError("--style_wav is required unless --libritts_csv is provided")
-        style_wav_path = rows[0].get("wav")
-        if not style_wav_path:
-            raise ValueError("Could not pick a style wav from --libritts_csv; pass --style_wav explicitly")
-
-    style_wav_abs = _resolve_wav_path(str(style_wav_path), base_dir)
-    audio_np, sr = sf.read(str(style_wav_abs), dtype="float32", always_2d=True)  # (T, C)
-    style_wav = torch.from_numpy(audio_np).transpose(0, 1)  # (C, T)
-    if style_wav.shape[0] > 1:
-        style_wav = style_wav.mean(dim=0, keepdim=True)
-    if sr != int(args.style_sr):
-        style_wav = torchaudio.transforms.Resample(orig_freq=sr, new_freq=int(args.style_sr))(style_wav)
-        sr = int(args.style_sr)
-    style_wav = style_wav.squeeze(0)  # (T,)
-
-    style_mel = _mel_spectrogram(style_wav, sr=sr, n_mels=n_mels).unsqueeze(0).to(device)  # (1, T, n_mels)
-    style_mel_len = torch.tensor([style_mel.shape[1]], dtype=torch.int64, device=device)
-    style = gst(style_mel, style_mel_len)
-
-    def _out_name(i: int) -> str:
-        # Keep everything in one folder: replace separators with '_'
-        if i < len(rows) and rows[i].get("wav"):
-            ref_wav_str = str(rows[i]["wav"])
-            name = ref_wav_str.replace("\\", "_").replace("/", "_")
-            return name if name.lower().endswith(".wav") else (name + ".wav")
-        return f"sample_{i:03d}.wav"
-
-    with torch.inference_mode():
-        for i, text in enumerate(texts):
-            speaker_idx = int(args.speaker_idx)
-            if i < len(rows) and rows[i].get("speaker_idx"):
-                speaker_idx = int(rows[i]["speaker_idx"])
-            if speaker_idx < 0 or speaker_idx >= speaker_count:
-                speaker_idx = 0
-            speaker = torch.tensor([speaker_idx], dtype=torch.int64, device=device)
-
-            x, x_len = _encode(char_to_id, text, args.end_token, device)
-            _, mel_post, gate, _ = tacotron(
-                chars_idx=x,
-                chars_idx_len=x_len,
-                teacher_forcing_dropout=0.0,
-                teacher_forcing=False,
-                speaker_id=speaker,
-                max_len_override=int(args.max_len),
-                encoded_extra=style,
-            )
-
-            mel_b80t = mel_post.transpose(1, 2)  # (1, 80, T)
-            if abs(float(args.mel_time_scale) - 1.0) > 1e-6:
-                mel_b80t = F.interpolate(
-                    mel_b80t,
-                    scale_factor=float(args.mel_time_scale),
-                    mode="linear",
-                    align_corners=False,
-                )
-
-            wav = generator(mel_b80t)
-            if wav.dim() == 3:
-                wav = wav.squeeze(1)  # (1, samples)
-
-            gate_end = gate.squeeze(-1) < 0
-            has_end = gate_end.any(dim=1)
-            end_idx = gate_end.int().argmax(dim=1)
-            mel_frames = torch.where(has_end, end_idx + 1, torch.full_like(end_idx, gate.shape[1]))
-            pred_len = (mel_frames.float() * float(args.mel_time_scale)).round().long() * 256
-            pred_len = pred_len.clamp(min=256, max=wav.shape[-1])
-
-            n = int(pred_len[0].item())
-            wav_0 = wav[0, :n].detach().cpu().numpy()
-
-            out_name = _out_name(i)
-            out_path = out_dir / out_name
-            sf.write(str(out_path), wav_0, int(args.sample_rate))
-
-            if hubert is not None and resampler_to_16k is not None:
-                mel_s = float(args.mel_time_scale)
-                wav_tensor = (
-                    torch.from_numpy(wav_0).to(device=device, dtype=torch.float32).unsqueeze(0)
-                )
-                wav_undo = _waveform_undo_mel_time_scale(wav_tensor, mel_s)
-                n_undo = _hubert_valid_samples_after_undo(n, mel_s, int(wav_undo.shape[-1]))
-                wav_undo_trim = wav_undo[:, :n_undo]
-                wav16_full = resampler_to_16k(wav_undo_trim).squeeze(0)
-                n16 = max(1, int(round(n_undo * 16000 / float(args.sample_rate))))
-                n16 = min(n16, int(wav16_full.shape[0]))
-                wav16 = wav16_full[:n16]
-                wav16_cpu = wav16.detach().cpu().numpy()
-
-                out_name_16k = out_name[:-4] + "_16k.wav" if out_name.lower().endswith(".wav") else out_name + "_16k.wav"
-                out_path_16k = out_dir / out_name_16k
-                sf.write(str(out_path_16k), wav16_cpu, 16000)
-
-                mask = torch.ones((1, wav16.shape[0]), device=device, dtype=torch.long)
-                score = torch.sigmoid(hubert(wav=wav16.unsqueeze(0), mask=mask)).squeeze(-1)[0].item()
-                scores.append(
-                    {
-                        "wav_path_orig": str(out_path),
-                        "wav_path_16k": str(out_path_16k),
-                        "generated_trustworthiness_score": float(score),
-                    }
-                )
-
-    if scores:
-        scores_path = out_dir / "scores.json"
-        scores_path.write_text(json.dumps(scores, indent=2))
-        print(f"Saved scores to {scores_path}")
-
-    print(f"Saved {len(texts)} wavs to {out_dir}")
-
-
-if __name__ == "__main__":
-    main()
-
-#!/usr/bin/env python3
-"""
-Generate test audio with a Tacotron2+GST checkpoint (style from a reference wav).
-
-Modeled after `say.ipynb`, but as a small standalone script.
-"""
-
-import argparse
-import json
-from pathlib import Path
-import sys
-from typing import Optional, TypedDict
-
-# Ensure local `src/` is on PYTHONPATH when running as a script.
-project_src = Path(__file__).resolve().parents[1]
-if str(project_src) not in sys.path:
-    sys.path.insert(0, str(project_src))
-
-import tspeech._torchvision_first  # noqa: F401
-
-import soundfile as sf
-import torch
-import torchaudio
+import torchaudio.functional as ta_f
 from torch.nn import functional as F
 from torch.nn.utils.rnn import pad_sequence
 
-from tspeech.model.tts import TTSModel
 from tspeech.model.tacotron2.hifi_gan import Generator
+from tspeech.model.tts import TTSModel
 
 
 class AttrDict(dict):
@@ -1070,12 +52,6 @@ def _normalize_text(text: str, allowed_chars: str) -> str:
     return "".join(ch for ch in text.lower() if ch in allowed)
 
 
-def _build_char_to_id(allowed_chars: str, end_token: str) -> dict[str, int]:
-    # Match TTSDataset: sorted unique chars (+ end token), 0 reserved for padding.
-    chars = sorted(set(allowed_chars + end_token))
-    return {ch: i + 1 for i, ch in enumerate(chars)}
-
-
 def _build_char_to_id_from_texts(texts: list[str], end_token: str) -> dict[str, int]:
     chars_set: set[str] = set()
     for t in texts:
@@ -1083,13 +59,6 @@ def _build_char_to_id_from_texts(texts: list[str], end_token: str) -> dict[str, 
     chars_set.add(end_token)
     chars = sorted(chars_set)
     return {ch: i + 1 for i, ch in enumerate(chars)}  # 0 reserved for padding
-
-
-def _encode(char_to_id: dict[str, int], text: str, end_token: str, device: torch.device):
-    ids = [char_to_id[ch] for ch in (text + end_token)]
-    x = torch.tensor(ids, dtype=torch.int64, device=device).unsqueeze(0)
-    x_len = torch.tensor([x.shape[1]], dtype=torch.int64, device=device)
-    return x, x_len
 
 
 def _encode_batch(
@@ -1118,36 +87,10 @@ def _mel_spectrogram(wav: torch.Tensor, sr: int, n_mels: int) -> torch.Tensor:
         norm="slaney",
         center=True,
     )(wav)
-    # (n_mels, T) -> (T, n_mels) in log space
     return torch.log(torch.clamp(melspec, min=1e-5)).transpose(0, 1)
 
 
-def _waveform_undo_mel_time_scale(wav: torch.Tensor, mel_time_scale: float) -> torch.Tensor:
-    """Invert mel time-axis stretch on vocoder output; same convention as ``TTSRLModel._waveform_for_hubert``."""
-    if wav.dim() == 1:
-        wav = wav.unsqueeze(0)
-    s = float(mel_time_scale)
-    if abs(s - 1.0) <= 1e-6:
-        return wav
-    return F.interpolate(
-        wav.unsqueeze(1),
-        scale_factor=float(1.0 / s),
-        mode="linear",
-        align_corners=False,
-    ).squeeze(1)
-
-
-def _hubert_valid_samples_after_undo(n_scaled: int, mel_time_scale: float, undo_len: int) -> int:
-    s = float(mel_time_scale)
-    if abs(s - 1.0) <= 1e-6:
-        n_undo = n_scaled
-    else:
-        n_undo = int(round(n_scaled / s))
-    return max(1, min(n_undo, undo_len))
-
-
 def _read_libritts_pipe_csv(path: Path) -> list[LibriTTSRow]:
-    # wav|speaker_id|text|duration|speaker_idx (header row)
     rows: list[LibriTTSRow] = []
     for line in path.read_text().splitlines():
         if not line.strip():
@@ -1258,7 +201,6 @@ def main() -> None:
                 rows = rows[:n_lim]
 
     texts = [_normalize_text(t, args.allowed_chars) for t in texts]
-    # Match `say.ipynb`: build the text encoder from dataset chars, not a fixed alphabet.
     char_to_id = _build_char_to_id_from_texts(texts, args.end_token)
 
     device = (
@@ -1267,7 +209,6 @@ def main() -> None:
         else torch.device(args.device)
     )
 
-    # Match `say.ipynb`: use LightningModule.load_from_checkpoint
     model = TTSModel.load_from_checkpoint(args.checkpoint, map_location="cpu").to(device).eval()
     if model.gst is None:
         raise ValueError("Loaded checkpoint has gst disabled (model.gst is None).")
@@ -1289,7 +230,6 @@ def main() -> None:
     generator = _load_hifigan_generator(args.vocoder_checkpoint_dir, device=device)
 
     hubert = None
-    resampler_to_16k = None
     if args.hubert_checkpoint:
         from tspeech.model.htmodel import HTModel
 
@@ -1302,13 +242,9 @@ def main() -> None:
         hubert.eval()
         for p_ in hubert.parameters():
             p_.requires_grad = False
-        resampler_to_16k = torchaudio.transforms.Resample(
-            orig_freq=int(args.sample_rate), new_freq=16000
-        ).to(device)
 
     scores: list[dict] = []
 
-    # Style embedding from reference wav
     style_wav_path: Optional[str] = args.style_wav
     if style_wav_path is None:
         if not rows:
@@ -1318,16 +254,16 @@ def main() -> None:
             raise ValueError("Could not pick a style wav from --libritts_csv; pass --style_wav explicitly")
 
     style_wav_abs = _resolve_wav_path(str(style_wav_path), base_dir)
-    audio_np, sr = sf.read(str(style_wav_abs), dtype="float32", always_2d=True)  # (T, C)
-    style_wav = torch.from_numpy(audio_np).transpose(0, 1)  # (C, T)
+    audio_np, sr = sf.read(str(style_wav_abs), dtype="float32", always_2d=True)
+    style_wav = torch.from_numpy(audio_np).transpose(0, 1)
     if style_wav.shape[0] > 1:
         style_wav = style_wav.mean(dim=0, keepdim=True)
     if sr != int(args.style_sr):
         style_wav = torchaudio.transforms.Resample(orig_freq=sr, new_freq=int(args.style_sr))(style_wav)
         sr = int(args.style_sr)
-    style_wav = style_wav.squeeze(0)  # (T,)
+    style_wav = style_wav.squeeze(0)
 
-    style_mel = _mel_spectrogram(style_wav, sr=sr, n_mels=n_mels).unsqueeze(0).to(device)  # (1, T, n_mels)
+    style_mel = _mel_spectrogram(style_wav, sr=sr, n_mels=n_mels).unsqueeze(0).to(device)
     style_mel_len = torch.tensor([style_mel.shape[1]], dtype=torch.int64, device=device)
     style = gst(style_mel, style_mel_len)
 
@@ -1368,7 +304,7 @@ def main() -> None:
                 encoded_extra=style.expand((end - start, -1, -1)),
             )
 
-            mel_b80t = mel_post.transpose(1, 2)  # (B, 80, T)
+            mel_b80t = mel_post.transpose(1, 2)
             if abs(mel_time_scale - 1.0) > 1e-6:
                 mel_b80t = F.interpolate(
                     mel_b80t,
@@ -1379,19 +315,14 @@ def main() -> None:
 
             wav = generator(mel_b80t)
             if wav.dim() == 3:
-                wav = wav.squeeze(1)  # (B, samples)
+                wav = wav.squeeze(1)
 
-            gate_end = gate.squeeze(-1) < 0  # (B, T_mel)
+            gate_end = gate.squeeze(-1) < 0
             has_end = gate_end.any(dim=1)
             end_idx = gate_end.int().argmax(dim=1)
             mel_frames = torch.where(has_end, end_idx + 1, torch.full_like(end_idx, gate.shape[1]))
             pred_len = (mel_frames.float() * mel_time_scale).round().long() * 256
             pred_len = pred_len.clamp(min=256, max=wav.shape[-1])
-
-            wav16 = None
-            if hubert is not None and resampler_to_16k is not None:
-                wav_h = _waveform_undo_mel_time_scale(wav, mel_time_scale)
-                wav16 = resampler_to_16k(wav_h)
 
             for bi, j in enumerate(range(start, end)):
                 out_name = _out_name(j)
@@ -1401,16 +332,23 @@ def main() -> None:
                 wav_0 = wav[bi, :n].detach().cpu().numpy()
                 sf.write(str(out_path), wav_0, int(args.sample_rate))
 
-                if hubert is not None and resampler_to_16k is not None and wav16 is not None:
-                    n_undo = _hubert_valid_samples_after_undo(n, mel_time_scale, int(wav_h.shape[1]))
-                    n16 = max(1, int(round(n_undo * 16000 / float(args.sample_rate))))
-                    n16 = min(n16, int(wav16.shape[1]))
-                    wav16_0 = wav16[bi, :n16]
-                    wav16_cpu = wav16_0.detach().cpu().numpy()
+                if hubert is not None:
+                    # Same trim as saved wav, then resample to 16 kHz for HuBERT (no separate mel undo).
+                    seg = wav[bi : bi + 1, :n]
+                    wav16_seg = ta_f.resample(
+                        seg,
+                        orig_freq=int(args.sample_rate),
+                        new_freq=16000,
+                    )
+                    wav16_0 = wav16_seg.squeeze(0)
 
-                    out_name_16k = out_name[:-4] + "_16k.wav" if out_name.lower().endswith(".wav") else out_name + "_16k.wav"
+                    out_name_16k = (
+                        out_name[:-4] + "_16k.wav"
+                        if out_name.lower().endswith(".wav")
+                        else out_name + "_16k.wav"
+                    )
                     out_path_16k = out_dir / out_name_16k
-                    sf.write(str(out_path_16k), wav16_cpu, 16000)
+                    sf.write(str(out_path_16k), wav16_0.detach().cpu().numpy(), 16000)
 
                     mask = torch.ones((1, wav16_0.shape[0]), device=device, dtype=torch.long)
                     score = torch.sigmoid(hubert(wav=wav16_0.unsqueeze(0), mask=mask)).squeeze(-1)[0].item()
