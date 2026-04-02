@@ -322,12 +322,13 @@ def main() -> None:
                 encoded_extra=style.expand((end - start, -1, -1)),
             )
 
-            mel_b80t = F.interpolate(
-                mel_post.transpose(1, 2),
-                scale_factor=scale_tacotron_hifi_gan,
-                mode="linear",
-                align_corners=False,
-            )
+            if scale_tacotron_hifi_gan != 1:
+                mel_b80t = F.interpolate(
+                    mel_post.transpose(1, 2),
+                    scale_factor=scale_tacotron_hifi_gan,
+                    mode="linear",
+                    align_corners=False,
+                )
 
             wav = generator(mel_b80t)
             if wav.dim() == 3:
