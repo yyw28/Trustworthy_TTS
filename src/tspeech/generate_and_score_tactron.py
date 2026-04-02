@@ -14,6 +14,7 @@ import json
 import sys
 from pathlib import Path
 from typing import Optional, TypedDict
+import yaml
 
 # Ensure local `src/` is on PYTHONPATH when running as a script.
 project_src = Path(__file__).resolve().parents[1]
@@ -32,6 +33,8 @@ from torch.nn.utils.rnn import pad_sequence
 from tspeech.model.tacotron2.hifi_gan import Generator
 from tspeech.model.tts import TTSModel
 
+HIFI_GAN_SR = 22050
+HUBERT_SR = 16000
 
 class AttrDict(dict):
     def __init__(self, *args, **kwargs):
@@ -113,13 +116,13 @@ def _read_libritts_pipe_csv(path: Path) -> list[LibriTTSRow]:
     return rows
 
 
-def _resolve_wav_path(wav_path: str, base_dir: Optional[Path]) -> Path:
+def _resolve_wav_path(wav_path: str, base_dir: Optional[Path]) -> str:
     p = Path(wav_path)
     if p.is_absolute():
         return p
     if base_dir is None:
         raise ValueError("Relative wav paths require --libritts_dir")
-    return base_dir / p
+    return str(base_dir / p)
 
 
 def _load_hifigan_generator(checkpoint_dir: str, device: torch.device) -> Generator:
@@ -145,6 +148,7 @@ def _load_hifigan_generator(checkpoint_dir: str, device: torch.device) -> Genera
 def main() -> None:
     p = argparse.ArgumentParser(description="Generate test samples with Tacotron2+GST checkpoint")
     p.add_argument("--checkpoint", required=True, help="Tacotron+GST checkpoint, e.g. checkpoint-epoch=85-....ckpt")
+    p.add_argument("--config", required=True, help="YAML file containing the config used to train the checkpoint")
     p.add_argument("--vocoder_checkpoint_dir", required=True, help="HiFi-GAN checkpoint dir (UNIVERSAL_V1)")
     p.add_argument("--hubert_checkpoint", default=None, help="Optional HuBERT trustworthiness checkpoint to score generated audio")
 
@@ -152,8 +156,6 @@ def main() -> None:
     p.add_argument("--libritts_csv", default=None, help="Optional LibriTTS CSV: wav|speaker_id|text|duration|speaker_idx")
 
     p.add_argument("--style_wav", default=None, help="Reference wav to compute GST style from (absolute or relative to --libritts_dir)")
-    p.add_argument("--style_sr", type=int, default=22050, help="Sample rate used to load style_wav")
-
     p.add_argument("--text", action="append", default=None, help="Text to synthesize (repeatable)")
     p.add_argument("--texts_file", default=None, help="Text file (one line per text)")
     p.add_argument("--output_dir", default="./tacotron_gst_test_audio")
@@ -164,19 +166,17 @@ def main() -> None:
     p.add_argument("--end_token", default="^")
     p.add_argument("--allowed_chars", default="!'(),.:;? \\-abcdefghijklmnopqrstuvwxyz")
     p.add_argument("--max_len", type=int, default=800)
-    p.add_argument(
-        "--mel_time_scale",
-        type=float,
-        default=22050 / 16000,
-        help="Time-scale mel before HiFi-GAN (default 22050/16000; matches say.ipynb zoom-style stretch)",
-    )
 
-    p.add_argument("--sample_rate", type=int, default=22050, help="Wav sample rate to save at")
     p.add_argument("--device", default="auto", help="auto/cuda/cpu")
     args = p.parse_args()
 
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Load model config file
+    with open(args.config) as infile:
+        config = yaml.safe_load(infile)
+    tacotron_sample_rate = config["data"]["sample_rate"]
 
     base_dir = Path(args.libritts_dir) if args.libritts_dir else None
     rows: list[LibriTTSRow] = []
@@ -253,18 +253,28 @@ def main() -> None:
         if not style_wav_path:
             raise ValueError("Could not pick a style wav from --libritts_csv; pass --style_wav explicitly")
 
-    style_wav_abs = _resolve_wav_path(str(style_wav_path), base_dir)
-    audio_np, sr = sf.read(str(style_wav_abs), dtype="float32", always_2d=True)
+    # Compute the reference audio style embedding
+    audio_np, sr = sf.read(
+        _resolve_wav_path(str(style_wav_path), base_dir),
+        dtype="float32",
+        always_2d=True,
+    )
     style_wav = torch.from_numpy(audio_np).transpose(0, 1)
+    # If necessary, convert stereo to mono by averaging the two channels
     if style_wav.shape[0] > 1:
         style_wav = style_wav.mean(dim=0, keepdim=True)
-    if sr != int(args.style_sr):
-        style_wav = torchaudio.transforms.Resample(orig_freq=sr, new_freq=int(args.style_sr))(style_wav)
-        sr = int(args.style_sr)
-    style_wav = style_wav.squeeze(0)
-
-    style_mel = _mel_spectrogram(style_wav, sr=sr, n_mels=n_mels).unsqueeze(0).to(device)
+    # If necessary, resample to the Tacotron sample rate
+    if sr != tacotron_sample_rate:
+        style_wav = torchaudio.functional.resample(
+            style_wav, orig_freq=sr, new_freq=tacotron_sample_rate
+        )
+    style_mel = (
+        _mel_spectrogram(style_wav.squeeze(0), sr=tacotron_sample_rate, n_mels=n_mels)
+        .unsqueeze(0)
+        .to(device)
+    )
     style_mel_len = torch.tensor([style_mel.shape[1]], dtype=torch.int64, device=device)
+    # Compute the style embedding
     style = gst(style_mel, style_mel_len)
 
     def _out_name(i: int) -> str:
@@ -275,7 +285,15 @@ def main() -> None:
         return f"sample_{i:03d}.wav"
 
     bs = max(1, int(args.batch_size))
-    mel_time_scale = float(args.mel_time_scale)
+
+    # The following scale ratio exists because of a mismatch between different components
+    # of Tacotron and the sample rates they expect to receive as input.
+    #
+    # Currently, our trained Tacotron instance outputs spectrograms with a sample rate of 16000 Hz,
+    # but this could change in the future. HiFi-GAN expects and outputs a sample rate of 22050 Hz.
+    scale_tacotron_hifi_gan = (
+        1 if tacotron_sample_rate == HIFI_GAN_SR else HIFI_GAN_SR / tacotron_sample_rate
+    )
 
     with torch.inference_mode():
         for start in range(0, len(texts), bs):
@@ -304,14 +322,12 @@ def main() -> None:
                 encoded_extra=style.expand((end - start, -1, -1)),
             )
 
-            mel_b80t = mel_post.transpose(1, 2)
-            if abs(mel_time_scale - 1.0) > 1e-6:
-                mel_b80t = F.interpolate(
-                    mel_b80t,
-                    scale_factor=mel_time_scale,
-                    mode="linear",
-                    align_corners=False,
-                )
+            mel_b80t = F.interpolate(
+                mel_post.transpose(1, 2),
+                scale_factor=scale_tacotron_hifi_gan,
+                mode="linear",
+                align_corners=False,
+            )
 
             wav = generator(mel_b80t)
             if wav.dim() == 3:
@@ -320,8 +336,12 @@ def main() -> None:
             gate_end = gate.squeeze(-1) < 0
             has_end = gate_end.any(dim=1)
             end_idx = gate_end.int().argmax(dim=1)
-            mel_frames = torch.where(has_end, end_idx + 1, torch.full_like(end_idx, gate.shape[1]))
-            pred_len = (mel_frames.float() * mel_time_scale).round().long() * 256
+            mel_frames = torch.where(
+                has_end, end_idx + 1, torch.full_like(end_idx, gate.shape[1])
+            )
+            pred_len = (
+                mel_frames.float() * scale_tacotron_hifi_gan
+            ).round().long() * 256
             pred_len = pred_len.clamp(min=256, max=wav.shape[-1])
 
             for bi, j in enumerate(range(start, end)):
@@ -330,15 +350,15 @@ def main() -> None:
 
                 n = int(pred_len[bi].item())
                 wav_0 = wav[bi, :n].detach().cpu().numpy()
-                sf.write(str(out_path), wav_0, int(args.sample_rate))
+                sf.write(str(out_path), wav_0, HIFI_GAN_SR)
 
                 if hubert is not None:
                     # Same trim as saved wav, then resample to 16 kHz for HuBERT (no separate mel undo).
                     seg = wav[bi : bi + 1, :n]
                     wav16_seg = ta_f.resample(
                         seg,
-                        orig_freq=int(args.sample_rate),
-                        new_freq=16000,
+                        orig_freq=HIFI_GAN_SR,
+                        new_freq=HUBERT_SR,
                     )
                     wav16_0 = wav16_seg.squeeze(0)
 
@@ -348,7 +368,7 @@ def main() -> None:
                         else out_name + "_16k.wav"
                     )
                     out_path_16k = out_dir / out_name_16k
-                    sf.write(str(out_path_16k), wav16_0.detach().cpu().numpy(), 16000)
+                    sf.write(str(out_path_16k), wav16_0.detach().cpu().numpy(), HUBERT_SR)
 
                     mask = torch.ones((1, wav16_0.shape[0]), device=device, dtype=torch.long)
                     score = torch.sigmoid(hubert(wav=wav16_0.unsqueeze(0), mask=mask)).squeeze(-1)[0].item()
@@ -370,4 +390,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
