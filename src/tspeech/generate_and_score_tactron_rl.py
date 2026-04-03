@@ -220,7 +220,6 @@ def _load_tts_rl_model(
     vocoder_checkpoint_dir: str,
     hubert_checkpoint_path: str,
     rl_temperature: float,
-    tts_config_path: str,
 ) -> TTSRLModel:
     """Load TTSRLModel; supports checkpoints without Lightning ``hyper_parameters``."""
     ckpt = torch.load(rl_ckpt_path, map_location="cpu", weights_only=False)
@@ -230,7 +229,6 @@ def _load_tts_rl_model(
         model = TTSRLModel.load_from_checkpoint(
             rl_ckpt_path,
             map_location="cpu",
-            tts_config_path=tts_config_path,
         )
     else:
         model = TTSRLModel(
@@ -238,7 +236,6 @@ def _load_tts_rl_model(
             vocoder_checkpoint_dir=vocoder_checkpoint_dir,
             hubert_checkpoint_path=hubert_checkpoint_path,
             rl_temperature=rl_temperature,
-            tts_config_path=tts_config_path,
         )
         missing, unexpected = model.load_state_dict(ckpt["state_dict"], strict=False)
         if missing:
@@ -365,6 +362,9 @@ def main() -> None:
     with open(args.config) as infile:
         yaml_cfg = yaml.safe_load(infile)
     tacotron_sample_rate = int(yaml_cfg["data"]["sample_rate"])
+    scale_tacotron_hifi_gan = (
+        1.0 if tacotron_sample_rate == HIFI_GAN_SR else HIFI_GAN_SR / float(tacotron_sample_rate)
+    )
 
     end_tok: Optional[str] = args.end_token if args.end_token else None
     transcripts = _preprocess_transcripts_like_dataset(
@@ -388,13 +388,13 @@ def main() -> None:
         vocoder_checkpoint_dir=args.vocoder_checkpoint_dir,
         hubert_checkpoint_path=args.hubert_checkpoint_path,
         rl_temperature=float(args.rl_temperature),
-        tts_config_path=args.config,
     )
 
     print(
         f"YAML data.sample_rate (frozen Tacotron)={tacotron_sample_rate}; "
+        f"mel→vocoder scale={scale_tacotron_hifi_gan:.6g}; "
         f"reference_sample_rate={int(args.reference_sample_rate)}; "
-        f"vocoder output SR={int(model.VOCODER_SAMPLE_RATE)} (expect {HIFI_GAN_SR})",
+        f"vocoder output SR={HIFI_GAN_SR}",
         flush=True,
     )
 
@@ -414,7 +414,7 @@ def main() -> None:
     scores: list[dict] = []
     bs = max(1, int(args.batch_size))
     ref_sr = int(args.reference_sample_rate)
-    sr_vocoder = int(model.VOCODER_SAMPLE_RATE)
+    sr_vocoder = HIFI_GAN_SR
 
     def _out_name(i: int) -> str:
         if i < len(rows) and rows[i].get("wav"):
@@ -458,14 +458,11 @@ def main() -> None:
                 ref_mel = mel0.unsqueeze(0).expand(bsz, -1, -1).contiguous()
                 ref_mel_len = torch.full((bsz,), ln0, dtype=torch.int64, device=device)
 
-            ref_mel_voc = model._rescale_mel_time_for_vocoder(ref_mel)
-            wav_ref = model.vocoder(ref_mel_voc)
+            # Reference mels use --reference_sample_rate (match RL datamodule); same as training_step
+            # ``wav_lens = mel_len * 256`` when mels are already HiFi-GAN–compatible.
+            wav_ref = model.vocoder(ref_mel)
             seq_len = wav_ref.shape[1]
-            wav_lens = model._wav_samples_from_mel_frames(
-                ref_mel_len,
-                float(model.vocoder_mel_time_scale),
-                seq_len,
-            )
+            wav_lens = ref_mel_len * 256
             time = torch.arange(seq_len, device=device)[None, :]
             mask = (time < wav_lens[:, None]).long()
 
@@ -497,18 +494,32 @@ def main() -> None:
                 style=style,
             )
 
-            mel_for_vocoder = model._rescale_mel_time_for_vocoder(mel_post)
+            # Tacotron mel frames are at tacotron_sample_rate; stretch to HiFi-GAN rate like
+            # ``generate_and_score_tactron.py``.
+            if scale_tacotron_hifi_gan != 1.0:
+                mel_bn_t = F.interpolate(
+                    mel_post.transpose(1, 2),
+                    scale_factor=scale_tacotron_hifi_gan,
+                    mode="linear",
+                    align_corners=False,
+                )
+                mel_for_vocoder = mel_bn_t.transpose(1, 2)
+            else:
+                mel_for_vocoder = mel_post
 
             wav = model.vocoder(mel_for_vocoder)
             if wav.dim() == 3:
                 wav = wav.squeeze(1)
 
-            mel_frames = TTSRLModel._mel_frames_from_pred_gate(gate, gate.shape[1])
-            pred_len = model._wav_samples_from_mel_frames(
-                mel_frames,
-                float(model.vocoder_mel_time_scale),
-                wav.shape[-1],
+            gate_end = gate.squeeze(-1) < 0
+            has_end = gate_end.any(dim=1)
+            end_idx = gate_end.int().argmax(dim=1)
+            mel_frames = torch.where(
+                has_end, end_idx + 1, torch.full_like(end_idx, gate.shape[1])
             )
+            pred_len = (
+                mel_frames.float() * scale_tacotron_hifi_gan
+            ).round().long() * 256
             pred_len = pred_len.clamp(min=256, max=wav.shape[-1])
 
             for bi, j in enumerate(range(start, end)):
