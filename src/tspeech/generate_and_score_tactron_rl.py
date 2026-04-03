@@ -15,6 +15,8 @@ import sys
 from pathlib import Path
 from typing import Optional, TypedDict
 
+import yaml
+
 # Ensure local `src/` is on PYTHONPATH when running as a script.
 project_src = Path(__file__).resolve().parents[1]
 if str(project_src) not in sys.path:
@@ -36,6 +38,7 @@ from tspeech.data.tts.dataset import _expand_abbreviations
 from tspeech.model.rl_gst_policy_option1 import RLGSTPolicy
 from tspeech.model.tts_rl import TTSRLModel
 
+HIFI_GAN_SR = 22050
 HUBERT_SR = 16000
 
 
@@ -115,17 +118,17 @@ def _read_libritts_pipe_csv(path: Path) -> list[LibriTTSRow]:
     return rows
 
 
-def _resolve_wav_path(wav_path: str, base_dir: Optional[Path]) -> Path:
+def _resolve_wav_path(wav_path: str, base_dir: Optional[Path]) -> str:
     p = Path(wav_path)
     if p.is_absolute():
-        return p
+        return str(p)
     if base_dir is None:
         raise ValueError("Relative wav paths require --libritts_dir")
-    return base_dir / p
+    return str(base_dir / p)
 
 
 def _reference_wav_to_mel_like_dataset(
-    wav_path: Path,
+    wav_path: str,
     sample_rate: int,
     n_mels: int,
     trim: bool,
@@ -134,7 +137,7 @@ def _reference_wav_to_mel_like_dataset(
     silence: int,
 ) -> tuple[torch.Tensor, int]:
     """Match ``TTSDataset`` reference mel (librosa load + trim + mel)."""
-    wav_np, _ = librosa.load(str(wav_path), sr=sample_rate, mono=True)
+    wav_np, _ = librosa.load(wav_path, sr=sample_rate, mono=True)
     wav = torch.tensor(wav_np, dtype=torch.float32)
     if trim:
         trimmed, _ = librosa.effects.trim(
@@ -275,7 +278,7 @@ def main() -> None:
     p.add_argument(
         "--vocoder_checkpoint_dir",
         default="/workplace/checkpoints/checkpoints/UNIVERSAL_V1",
-        help="HiFi-GAN dir (same as training)",
+        help="HiFi-GAN checkpoint dir (UNIVERSAL_V1); same as training",
     )
     p.add_argument(
         "--hubert_checkpoint_path",
@@ -291,7 +294,7 @@ def main() -> None:
     p.add_argument(
         "--config",
         required=True,
-        help="YAML file with data.sample_rate for the frozen Tacotron (generate_and_score_tactron.py)",
+        help="YAML file containing the config used for the frozen Tacotron (as in generate_and_score_tactron.py)",
     )
     p.add_argument(
         "--reference_sample_rate",
@@ -299,13 +302,21 @@ def main() -> None:
         default=22050,
         help="SR for reference wav→mel (must match RL TTSDatamodule data.sample_rate; often 22050 while Tacotron YAML is 16 kHz)",
     )
-    p.add_argument("--libritts_dir", default="/workplace/LibriTTS", help="Base dir for relative wav paths in CSV")
-    p.add_argument("--libritts_csv", default=None, help="CSV: wav|speaker_id|text|duration|speaker_idx")
-    p.add_argument("--style_wav", default=None, help="With --text only: reference wav for trust scores (same for all lines)")
-    p.add_argument("--text", action="append", default=None)
-    p.add_argument("--texts_file", default=None)
+    p.add_argument("--libritts_dir", default="/workplace/LibriTTS", help="Base directory for LibriTTS wav paths")
+    p.add_argument(
+        "--libritts_csv",
+        default=None,
+        help="Optional LibriTTS CSV: wav|speaker_id|text|duration|speaker_idx",
+    )
+    p.add_argument(
+        "--style_wav",
+        default=None,
+        help="With --text/--texts_file only: reference wav for trust scores (absolute or relative to --libritts_dir)",
+    )
+    p.add_argument("--text", action="append", default=None, help="Text to synthesize (repeatable)")
+    p.add_argument("--texts_file", default=None, help="Text file (one line per text)")
     p.add_argument("--output_dir", default="./tacotron_rl_test_audio")
-    p.add_argument("--batch_size", type=int, default=4, help="Lower if GPU OOM")
+    p.add_argument("--batch_size", type=int, default=8, help="Batch size for faster generation on GPU; lower if OOM")
     p.add_argument("--speaker_idx", type=int, default=0)
     p.add_argument("--end_token", default="^")
     p.add_argument("--allowed_chars", default="!'(),.:;? \\-abcdefghijklmnopqrstuvwxyz")
@@ -351,6 +362,10 @@ def main() -> None:
     if not texts:
         raise ValueError("Provide --text/--texts_file or --libritts_csv")
 
+    with open(args.config) as infile:
+        yaml_cfg = yaml.safe_load(infile)
+    tacotron_sample_rate = int(yaml_cfg["data"]["sample_rate"])
+
     end_tok: Optional[str] = args.end_token if args.end_token else None
     transcripts = _preprocess_transcripts_like_dataset(
         texts,
@@ -374,6 +389,13 @@ def main() -> None:
         hubert_checkpoint_path=args.hubert_checkpoint_path,
         rl_temperature=float(args.rl_temperature),
         tts_config_path=args.config,
+    )
+
+    print(
+        f"YAML data.sample_rate (frozen Tacotron)={tacotron_sample_rate}; "
+        f"reference_sample_rate={int(args.reference_sample_rate)}; "
+        f"vocoder output SR={int(model.VOCODER_SAMPLE_RATE)} (expect {HIFI_GAN_SR})",
+        flush=True,
     )
 
     tts = model.tts
