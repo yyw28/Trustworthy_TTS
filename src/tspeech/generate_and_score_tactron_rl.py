@@ -2,10 +2,6 @@
 """
 Generate audio with a trained TTSRLModel checkpoint (RL GST policy + frozen Tacotron+GST).
 
-Mirrors ``generate_and_score_tactron.py`` outputs (wav, optional *_16k.wav, scores.json)
-but uses the RL pipeline: reference mel → vocoder → HuBERT trust scores → BERT+RL policy
-→ GST style → Tacotron → HiFi-GAN.
-
 Requires ``--libritts_csv`` (or ``--text`` with ``--style_wav``) so each utterance has a
 reference wav for trust scores (same as training/validation).
 """
@@ -39,6 +35,8 @@ from torch.nn.utils.rnn import pad_sequence
 from tspeech.data.tts.dataset import _expand_abbreviations
 from tspeech.model.rl_gst_policy_option1 import RLGSTPolicy
 from tspeech.model.tts_rl import TTSRLModel
+
+HUBERT_SR = 16000
 
 
 class LibriTTSRow(TypedDict, total=False):
@@ -219,19 +217,25 @@ def _load_tts_rl_model(
     vocoder_checkpoint_dir: str,
     hubert_checkpoint_path: str,
     rl_temperature: float,
+    tts_config_path: str,
 ) -> TTSRLModel:
     """Load TTSRLModel; supports checkpoints without Lightning ``hyper_parameters``."""
     ckpt = torch.load(rl_ckpt_path, map_location="cpu", weights_only=False)
     hp = ckpt.get("hyper_parameters") or {}
 
     if isinstance(hp, dict) and hp.get("tts_checkpoint_path"):
-        model = TTSRLModel.load_from_checkpoint(rl_ckpt_path, map_location="cpu")
+        model = TTSRLModel.load_from_checkpoint(
+            rl_ckpt_path,
+            map_location="cpu",
+            tts_config_path=tts_config_path,
+        )
     else:
         model = TTSRLModel(
             tts_checkpoint_path=tts_checkpoint_path,
             vocoder_checkpoint_dir=vocoder_checkpoint_dir,
             hubert_checkpoint_path=hubert_checkpoint_path,
             rl_temperature=rl_temperature,
+            tts_config_path=tts_config_path,
         )
         missing, unexpected = model.load_state_dict(ckpt["state_dict"], strict=False)
         if missing:
@@ -284,25 +288,28 @@ def main() -> None:
         default=1.0,
         help="Policy temperature (must match training; config/tts-rl.json often uses 1.0)",
     )
+    p.add_argument(
+        "--config",
+        required=True,
+        help="YAML file with data.sample_rate for the frozen Tacotron (generate_and_score_tactron.py)",
+    )
+    p.add_argument(
+        "--reference_sample_rate",
+        type=int,
+        default=22050,
+        help="SR for reference wav→mel (must match RL TTSDatamodule data.sample_rate; often 22050 while Tacotron YAML is 16 kHz)",
+    )
     p.add_argument("--libritts_dir", default="/workplace/LibriTTS", help="Base dir for relative wav paths in CSV")
     p.add_argument("--libritts_csv", default=None, help="CSV: wav|speaker_id|text|duration|speaker_idx")
     p.add_argument("--style_wav", default=None, help="With --text only: reference wav for trust scores (same for all lines)")
     p.add_argument("--text", action="append", default=None)
     p.add_argument("--texts_file", default=None)
     p.add_argument("--output_dir", default="./tacotron_rl_test_audio")
-    p.add_argument("--limit", type=int, default=None)
     p.add_argument("--batch_size", type=int, default=4, help="Lower if GPU OOM")
     p.add_argument("--speaker_idx", type=int, default=0)
     p.add_argument("--end_token", default="^")
     p.add_argument("--allowed_chars", default="!'(),.:;? \\-abcdefghijklmnopqrstuvwxyz")
     p.add_argument("--max_len", type=int, default=800)
-    p.add_argument(
-        "--mel_time_scale",
-        type=float,
-        default=1.0,
-        help="1.0 = no stretch (recommended for RL). Use 22050/16000 only if you match say.ipynb / Tacotron script.",
-    )
-    p.add_argument("--sample_rate", type=int, default=22050, help="Audio + reference mel sample rate (match training)")
     p.add_argument(
         "--no_expand_abbreviations",
         action="store_true",
@@ -344,12 +351,6 @@ def main() -> None:
     if not texts:
         raise ValueError("Provide --text/--texts_file or --libritts_csv")
 
-    if args.limit is not None and int(args.limit) > 0:
-        n_lim = int(args.limit)
-        texts = texts[:n_lim]
-        if rows:
-            rows = rows[:n_lim]
-
     end_tok: Optional[str] = args.end_token if args.end_token else None
     transcripts = _preprocess_transcripts_like_dataset(
         texts,
@@ -372,6 +373,7 @@ def main() -> None:
         vocoder_checkpoint_dir=args.vocoder_checkpoint_dir,
         hubert_checkpoint_path=args.hubert_checkpoint_path,
         rl_temperature=float(args.rl_temperature),
+        tts_config_path=args.config,
     )
 
     tts = model.tts
@@ -389,7 +391,8 @@ def main() -> None:
 
     scores: list[dict] = []
     bs = max(1, int(args.batch_size))
-    mel_time_scale = float(args.mel_time_scale)
+    ref_sr = int(args.reference_sample_rate)
+    sr_vocoder = int(model.VOCODER_SAMPLE_RATE)
 
     def _out_name(i: int) -> str:
         if i < len(rows) and rows[i].get("wav"):
@@ -410,7 +413,7 @@ def main() -> None:
                     rows,
                     range(start, end),
                     base_dir,
-                    int(args.sample_rate),
+                    ref_sr,
                     n_mels,
                     device,
                     trim=trim_ref,
@@ -422,7 +425,7 @@ def main() -> None:
                 ref_path = _resolve_wav_path(str(args.style_wav), base_dir)
                 mel0, ln0 = _reference_wav_to_mel_like_dataset(
                     ref_path,
-                    sample_rate=int(args.sample_rate),
+                    sample_rate=ref_sr,
                     n_mels=n_mels,
                     trim=trim_ref,
                     trim_top_db=int(args.trim_top_db),
@@ -433,9 +436,14 @@ def main() -> None:
                 ref_mel = mel0.unsqueeze(0).expand(bsz, -1, -1).contiguous()
                 ref_mel_len = torch.full((bsz,), ln0, dtype=torch.int64, device=device)
 
-            wav_ref = model.vocoder(ref_mel)
+            ref_mel_voc = model._rescale_mel_time_for_vocoder(ref_mel)
+            wav_ref = model.vocoder(ref_mel_voc)
             seq_len = wav_ref.shape[1]
-            wav_lens = ref_mel_len * 256
+            wav_lens = model._wav_samples_from_mel_frames(
+                ref_mel_len,
+                float(model.vocoder_mel_time_scale),
+                seq_len,
+            )
             time = torch.arange(seq_len, device=device)[None, :]
             mask = (time < wav_lens[:, None]).long()
 
@@ -467,26 +475,18 @@ def main() -> None:
                 style=style,
             )
 
-            # HiFiGANVocoder expects (B, T_mel, n_mels); interpolate time on (B, n_mels, T) then transpose back.
-            mel_bn_t = mel_post.transpose(1, 2)
-            if abs(mel_time_scale - 1.0) > 1e-6:
-                mel_bn_t = F.interpolate(
-                    mel_bn_t,
-                    scale_factor=mel_time_scale,
-                    mode="linear",
-                    align_corners=False,
-                )
-            mel_for_vocoder = mel_bn_t.transpose(1, 2)
+            mel_for_vocoder = model._rescale_mel_time_for_vocoder(mel_post)
 
             wav = model.vocoder(mel_for_vocoder)
             if wav.dim() == 3:
                 wav = wav.squeeze(1)
 
-            gate_end = gate.squeeze(-1) < 0
-            has_end = gate_end.any(dim=1)
-            end_idx = gate_end.int().argmax(dim=1)
-            mel_frames = torch.where(has_end, end_idx + 1, torch.full_like(end_idx, gate.shape[1]))
-            pred_len = (mel_frames.float() * mel_time_scale).round().long() * 256
+            mel_frames = TTSRLModel._mel_frames_from_pred_gate(gate, gate.shape[1])
+            pred_len = model._wav_samples_from_mel_frames(
+                mel_frames,
+                float(model.vocoder_mel_time_scale),
+                wav.shape[-1],
+            )
             pred_len = pred_len.clamp(min=256, max=wav.shape[-1])
 
             for bi, j in enumerate(range(start, end)):
@@ -494,14 +494,14 @@ def main() -> None:
                 out_path = out_dir / out_name
                 n = int(pred_len[bi].item())
                 wav_0 = wav[bi, :n].detach().cpu().numpy()
-                sf.write(str(out_path), wav_0, int(args.sample_rate))
+                sf.write(str(out_path), wav_0, sr_vocoder)
 
                 if not args.no_scores:
                     seg = wav[bi : bi + 1, :n]
                     wav16_seg = ta_f.resample(
                         seg,
-                        orig_freq=int(args.sample_rate),
-                        new_freq=16000,
+                        orig_freq=sr_vocoder,
+                        new_freq=HUBERT_SR,
                     )
                     wav16_0 = wav16_seg.squeeze(0)
                     out_name_16k = (
@@ -510,7 +510,7 @@ def main() -> None:
                         else out_name + "_16k.wav"
                     )
                     out_path_16k = out_dir / out_name_16k
-                    sf.write(str(out_path_16k), wav16_0.detach().cpu().numpy(), 16000)
+                    sf.write(str(out_path_16k), wav16_0.detach().cpu().numpy(), HUBERT_SR)
 
                     mask_s = torch.ones((1, wav16_0.shape[0]), device=device, dtype=torch.long)
                     score = torch.sigmoid(
@@ -534,3 +534,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
