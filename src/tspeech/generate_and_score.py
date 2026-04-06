@@ -294,7 +294,9 @@ def main() -> None:
             # Get style from RL policy: dummy score (0.5) -> BERT -> policy -> GST style
             dummy_score = torch.tensor([0.5], device=device, dtype=torch.float32).expand(chars_idx.shape[0])
             bert_embeddings = model.bert_gst_encoder(score=dummy_score, text=[text])
-            gst_weights, _, _ = model.rl_policy(bert_embeddings, deterministic=True)
+            gst_weights, _, _, _, _, _ = model.rl_policy(
+                bert_embeddings, deterministic=True
+            )
             batch_size = chars_idx.shape[0]
             style = model.tts.gst.stl.attention.out_proj(
                 torch.matmul(gst_weights, torch.tanh(model.tts.gst.stl.embed)).reshape(

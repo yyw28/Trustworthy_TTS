@@ -8,8 +8,6 @@ We use a Logistic-Normal policy:
   gst_weights = softmax(z / temperature)
 """
 
-from typing import Optional, Tuple
-
 import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
@@ -17,7 +15,11 @@ from torch.distributions import Normal
 
 
 class RLGSTPolicy(nn.Module):
-    """BERT embeddings → Normal(mu, sigma) → z → softmax(z/temp) = GST weights. Returns weights, log_prob(z), entropy."""
+    """BERT → Normal(mu, sigma) → z → softmax(z/temp) = GST weights.
+
+    Returns ``gst_weights``, ``log_probs`` (per-dim, for REINFORCE), ``z``, and
+    scalar diagnostics ``mu_std``, ``log_std_mean``, ``std_mean`` for logging.
+    """
 
     def __init__(
         self,
@@ -54,7 +56,7 @@ class RLGSTPolicy(nn.Module):
                 nn.init.zeros_(m.bias)
         nn.init.constant_(self.log_std_head.bias, init_log_std)
 
-    def forward(self,bert_embeddings: Tensor):
+    def forward(self, bert_embeddings: Tensor, deterministic: bool = False):
         batch_size = bert_embeddings.shape[0]
         h = self.trunk(bert_embeddings) #[batch_size, 1024] -> [batch_size, 256*8]
         mu = self.mu_head(h).view(batch_size * self.gst_heads, self.gst_token_num) #[batch_size, 256*8] -> [batch_size*8, 10]
@@ -65,12 +67,18 @@ class RLGSTPolicy(nn.Module):
         )
         std = torch.exp(log_std) #[batch_size*8, 10] -> [batch_size*8, 10]
         dist = Normal(mu, std) #[batch_size*8, 10] -> [batch_size*8, 10]
-        z = dist.rsample() #[batch_size*8, 10] -> [batch_size*8, 10]
+        if deterministic:
+            z = mu
+        else:
+            z = dist.rsample() #[batch_size*8, 10] -> [batch_size*8, 10]
         log_probs = dist.log_prob(z) #[batch_size*8, 10] -> [batch_size*8, 10]
-        entropy = dist.entropy() #[batch_size*8, 10] -> [batch_size*8, 10]
 
         gst_weights = F.softmax(z / self.temperature, dim=1) #[batch_size*8, 10] -> [batch_size*8, 10]
-        return gst_weights, log_probs, entropy
+        md = mu.detach()
+        mu_std = md.std(unbiased=False) if md.numel() > 1 else md.new_zeros(())
+        log_std_mean = log_std.detach().mean()
+        std_mean = std.detach().mean()
+        return gst_weights, log_probs, z, mu_std, log_std_mean, std_mean
 
     # def get_log_probs(self, bert_embeddings: Tensor, z: Tensor) -> Tensor:
     #     """Log prob of z under current policy (for REINFORCE)."""

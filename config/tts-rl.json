@@ -1,9 +1,9 @@
 {
   "data": {
-    "allowed_chars": "!'(),.:;? \\-abcdefghijklmnopqrstuvwxyz",
+    "allowed_chars": "!'(),.:;? \\-0123456789abcdefghijklmnopqrstuvwxyz",
     "batch_size": 16,
     "csv_test": "libritts-test.csv",
-    "csv_train": "libritts-train.csv",
+    "csv_train": "libritts-train-with-trust.csv",
     "csv_val": "libritts-val.csv",
     "end_token": "^",
     "expand_abbreviations": true,
@@ -18,6 +18,7 @@
     "trim_top_db": 40
   },
   "model": {
+    "tacotron_config_path": "config/config.yaml",
     "bert_model_name": "bert-base-uncased",
     "hubert_checkpoint_path": null,
     "hubert_model_name": "facebook/hubert-base-ls960",
@@ -46,9 +47,19 @@
       {
         "class_path": "lightning.pytorch.callbacks.ModelCheckpoint",
         "init_args": {
-          "filename": "checkpoint-{epoch}-{step}",
+          "filename": "best-val_loss-ep{epoch:02d}-step{step}",
           "mode": "min",
           "monitor": "val_loss",
+          "save_last": false,
+          "save_top_k": 1
+        }
+      },
+      {
+        "class_path": "lightning.pytorch.callbacks.ModelCheckpoint",
+        "init_args": {
+          "filename": "best-val_score_loss-ep{epoch:02d}-step{step}",
+          "mode": "min",
+          "monitor": "val_score_loss",
           "save_last": false,
           "save_top_k": 1
         }
