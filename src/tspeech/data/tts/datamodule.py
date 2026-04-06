@@ -1,14 +1,26 @@
 import csv
+import warnings
 from os import path
 from typing import Final, Optional
 
+import numpy as np
 import pandas as pd
 import torch
 from lightning import LightningDataModule
 from torch import Tensor, nn
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, WeightedRandomSampler
 
 from tspeech.data.tts.dataset import TTSBatch, TTSDataset
+
+# If train CSV has no explicit score column, try these names (first match wins).
+_DEFAULT_REWEIGHT_SCORE_COLUMNS: tuple[str, ...] = (
+    "trust_score",
+    "ref_tw_score",
+    "tw_score",
+    "huBERT_score",
+    "hubert_score",
+    "trustworthy",
+)
 
 
 def collate_fn(data: list[TTSBatch]) -> TTSBatch:
@@ -70,6 +82,9 @@ class TTSDatamodule(LightningDataModule):
         trim: bool = True,
         trim_top_db: int = 60,
         trim_frame_length: int = 2048,
+        reweight_train_sampler: bool = False,
+        reweight_threshold: float = 0.6,
+        reweight_score_column: Optional[str] = None,
     ):
 
         super().__init__()
@@ -91,39 +106,27 @@ class TTSDatamodule(LightningDataModule):
         self.expand_abbreviations: Final[bool] = expand_abbreviations
         self.num_mels: Final[int] = num_mels
         self.sample_rate: Final[int] = sample_rate
+        self.reweight_train_sampler: Final[bool] = reweight_train_sampler
+        self.reweight_threshold: Final[float] = reweight_threshold
+        self.reweight_score_column: Final[Optional[str]] = reweight_score_column
 
-    def setup(self, stage: str):
-        if stage == "fit":
-            self._train_dataloader = DataLoader(
-                self.__load_dataset(self.csv_train),
-                batch_size=self.batch_size,
-                collate_fn=collate_fn,
-                shuffle=True,
-                drop_last=True,
-                pin_memory=True,
-                num_workers=self.num_workers,
-                persistent_workers=True,
-            )
-            self._val_dataloader = DataLoader(
-                self.__load_dataset(self.csv_val),
-                batch_size=self.batch_size * 4,
-                collate_fn=collate_fn,
-                shuffle=False,
-                drop_last=False,
-                pin_memory=True,
-                num_workers=self.num_workers,
-                persistent_workers=True,
-            )
-
-    def __load_dataset(self, filename: str) -> TTSDataset:
-        df = pd.read_csv(
-            path.join(self.dataset_dir, filename), delimiter="|", quoting=csv.QUOTE_NONE
+    def _read_manifest(self, filename: str) -> pd.DataFrame:
+        return pd.read_csv(
+            path.join(self.dataset_dir, filename),
+            delimiter="|",
+            quoting=csv.QUOTE_NONE,
         )
 
+    @staticmethod
+    def _series_str_clean(s: pd.Series) -> list[str]:
+        """CSV cells missing or mis-parsed (NaN) become ''; everything else str."""
+        return ["" if pd.isna(x) else str(x) for x in s]
+
+    def _df_to_dataset(self, df: pd.DataFrame) -> TTSDataset:
         return TTSDataset(
-            filenames=list(df.wav),
-            texts=list(df.text),
-            speaker_ids=list(df.speaker_idx),
+            filenames=self._series_str_clean(df.wav),
+            texts=self._series_str_clean(df.text),
+            speaker_ids=list(pd.to_numeric(df.speaker_idx, errors="coerce").fillna(0).astype(int)),
             base_dir=self.dataset_dir,
             allowed_chars=self.allowed_chars,
             end_token=self.end_token,
@@ -135,6 +138,99 @@ class TTSDatamodule(LightningDataModule):
             num_mels=self.num_mels,
             sample_rate=self.sample_rate,
         )
+
+    def _resolve_reweight_column(self, df: pd.DataFrame) -> Optional[str]:
+        if self.reweight_score_column is not None:
+            c = self.reweight_score_column
+            if c not in df.columns:
+                return None
+            return c
+        for c in _DEFAULT_REWEIGHT_SCORE_COLUMNS:
+            if c in df.columns:
+                return c
+        return None
+
+    def _train_sample_weights(self, df: pd.DataFrame) -> Optional[torch.Tensor]:
+        """
+        Per-index weights so low vs high trust (split at ``reweight_threshold``) are
+        sampled with equal total mass per class (inverse class frequency).
+        """
+        col = self._resolve_reweight_column(df)
+        if col is None:
+            return None
+        scores = pd.to_numeric(df[col], errors="coerce")
+        if scores.isna().all():
+            return None
+        scores = scores.fillna(scores.median())
+        s = scores.to_numpy(dtype=np.float64)
+        thr = float(self.reweight_threshold)
+        low_mask = s <= thr
+        high_mask = ~low_mask
+        n_low = int(low_mask.sum())
+        n_high = int(high_mask.sum())
+        if n_low == 0 or n_high == 0:
+            warnings.warn(
+                "reweight_train_sampler: all rows on one side of reweight_threshold; "
+                "using uniform sampling.",
+                UserWarning,
+                stacklevel=2,
+            )
+            return None
+        w = np.zeros(len(df), dtype=np.float64)
+        w[low_mask] = 1.0 / n_low
+        w[high_mask] = 1.0 / n_high
+        return torch.from_numpy(w)
+
+    def setup(self, stage: str):
+        if stage == "fit":
+            df_train = self._read_manifest(self.csv_train)
+            train_ds = self._df_to_dataset(df_train)
+
+            train_kw: dict = dict(
+                batch_size=self.batch_size,
+                collate_fn=collate_fn,
+                drop_last=True,
+                pin_memory=True,
+                num_workers=self.num_workers,
+                persistent_workers=True,
+            )
+
+            if self.reweight_train_sampler:
+                weights = self._train_sample_weights(df_train)
+                if weights is None:
+                    warnings.warn(
+                        "reweight_train_sampler is True but no usable score column was found "
+                        f"(tried reweight_score_column={self.reweight_score_column!r} then "
+                        f"{_DEFAULT_REWEIGHT_SCORE_COLUMNS}). Using uniform shuffle.",
+                        UserWarning,
+                        stacklevel=2,
+                    )
+                    train_kw["shuffle"] = True
+                else:
+                    sampler = WeightedRandomSampler(
+                        weights.double(),
+                        num_samples=len(train_ds),
+                        replacement=True,
+                    )
+                    train_kw["sampler"] = sampler
+                    train_kw["shuffle"] = False
+            else:
+                train_kw["shuffle"] = True
+
+            self._train_dataloader = DataLoader(train_ds, **train_kw)
+            self._val_dataloader = DataLoader(
+                self._df_to_dataset(self._read_manifest(self.csv_val)),
+                batch_size=self.batch_size * 4,
+                collate_fn=collate_fn,
+                shuffle=False,
+                drop_last=False,
+                pin_memory=True,
+                num_workers=self.num_workers,
+                persistent_workers=True,
+            )
+
+    def __load_dataset(self, filename: str) -> TTSDataset:
+        return self._df_to_dataset(self._read_manifest(filename))
 
     def train_dataloader(self) -> DataLoader:
         return self._train_dataloader

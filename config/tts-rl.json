@@ -1,0 +1,79 @@
+{
+  "data": {
+    "allowed_chars": "!'(),.:;? \\-0123456789abcdefghijklmnopqrstuvwxyz",
+    "batch_size": 16,
+    "csv_test": "libritts-test.csv",
+    "csv_train": "libritts-train-with-trust.csv",
+    "csv_val": "libritts-val.csv",
+    "end_token": "^",
+    "expand_abbreviations": true,
+    "num_mels": 80,
+    "num_workers": 4,
+    "reweight_train_sampler": true,
+    "reweight_threshold": 0.6,
+    "sample_rate": 22050,
+    "silence": 0,
+    "trim": true,
+    "trim_frame_length": 1024,
+    "trim_top_db": 40
+  },
+  "model": {
+    "tacotron_config_path": "config/config.yaml",
+    "bert_model_name": "bert-base-uncased",
+    "hubert_checkpoint_path": null,
+    "hubert_model_name": "facebook/hubert-base-ls960",
+    "rl_entropy_coef": 0.01,
+    "rl_temperature": 1,
+    "save_audio_dir": "saved_audio_rl",
+    "save_audio_every_n_steps": 3000
+  },
+  "optimizer": {
+    "class_path": "torch.optim.Adam",
+    "init_args": {
+      "lr": 0.0001
+    }
+  },
+  "trainer": {
+    "accelerator": "gpu",
+    "callbacks": [
+      {
+        "class_path": "lightning.pytorch.callbacks.EarlyStopping",
+        "init_args": {
+          "mode": "min",
+          "monitor": "val_loss",
+          "patience": 10
+        }
+      },
+      {
+        "class_path": "lightning.pytorch.callbacks.ModelCheckpoint",
+        "init_args": {
+          "filename": "best-val_loss-ep{epoch:02d}-step{step}",
+          "mode": "min",
+          "monitor": "val_loss",
+          "save_last": false,
+          "save_top_k": 1
+        }
+      },
+      {
+        "class_path": "lightning.pytorch.callbacks.ModelCheckpoint",
+        "init_args": {
+          "filename": "best-val_score_loss-ep{epoch:02d}-step{step}",
+          "mode": "min",
+          "monitor": "val_score_loss",
+          "save_last": false,
+          "save_top_k": 1
+        }
+      }
+    ],
+    "logger": {
+      "class_path": "lightning.pytorch.loggers.TensorBoardLogger",
+      "init_args": {
+        "default_hp_metric": false,
+        "name": "tts_rl",
+        "save_dir": "lightning_logs"
+      }
+    },
+    "log_every_n_steps": 10,
+    "precision": "16-mixed"
+  }
+}
