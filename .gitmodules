@@ -1,0 +1,6 @@
+[submodule "external/baseline_Tacotron"]
+	path = external/baseline_Tacotron
+	url = https://github.com/yyw28/baseline_Tacotron.git
+[submodule "external/trust_top_bottom_RL_optimized"]
+	path = external/trust_top_bottom_RL_optimized
+	url = https://github.com/yyw28/trust_top_bottom_RL_optimized.git
