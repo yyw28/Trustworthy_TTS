@@ -14,7 +14,7 @@ from tspeech.data.tis_dataset import TISDataset
 class HTDataModule(LightningDataModule):
     def __init__(
         self,
-        datasets: dict[Literal["tis"] | Literal["synth"], str],
+        datasets: dict[Literal["tis", "synth"], str],
         batch_size: int,
         num_workers: int,
     ):
@@ -76,7 +76,7 @@ class HTDataModule(LightningDataModule):
             drop_last=True,
             pin_memory=True,
             num_workers=self.num_workers,
-            persistent_workers=True,
+            persistent_workers=self.num_workers > 0,
         )
 
     def val_dataloader(self) -> DataLoader:
@@ -88,7 +88,7 @@ class HTDataModule(LightningDataModule):
             drop_last=False,
             pin_memory=True,
             num_workers=self.num_workers,
-            persistent_workers=True,
+            persistent_workers=self.num_workers > 0,
         )
 
     def test_dataloader(self) -> DataLoader:
@@ -100,5 +100,5 @@ class HTDataModule(LightningDataModule):
             drop_last=False,
             pin_memory=True,
             num_workers=self.num_workers,
-            persistent_workers=True,
+            persistent_workers=self.num_workers > 0,
         )
