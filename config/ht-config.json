@@ -1,13 +1,14 @@
 {
     "data": {
         "batch_size": 4,
+        "num_workers": 4,
         "datasets": {
-            "tis": "datasets/tis"
+            "tis": "tis"
         }
     },
     "model": {
         "hubert_model_name": "facebook/hubert-base-ls960",
-        "trainable_layers": 10
+        "trainable_layers": 2
     },
     "optimizer": {
         "class_path": "Adam",
