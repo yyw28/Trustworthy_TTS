@@ -27,9 +27,9 @@ class RLGSTPolicy(nn.Module):
         gst_token_num: int = 10,
         gst_heads: int = 8, #8 GST heads
         hidden_dim: int = 256,
-        temperature: float = 0.10,
+        temperature: float = 1.0,
         init_log_std: float = -0.5,
-        log_std_min: float = -5.0,
+        log_std_min: float = -1.0,
         log_std_max: float = 2.0,
     ):
         super().__init__()

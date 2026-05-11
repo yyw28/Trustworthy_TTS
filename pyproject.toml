@@ -23,11 +23,16 @@ dependencies = [
     "pytest==9.0.2",
     "tensorboard==2.20.0",
     "torch==2.9.1",
+    # Must match torch (same CUDA wheel index as torch/torchaudio). A stale torchvision
+    # (e.g. 0.19 for torch 2.4) with torch 2.9 breaks torchvision.extension and triggers
+    # circular-import errors when Lightning pulls torchmetrics → torchvision.
+    "torchvision==0.24.1",
     "torchcodec==0.9.1",
     "transformers==4.57.3",
     "pandas==2.3.3",
     "torchaudio==2.9.1",
     "soundfile==0.13.1",
+    "praat-parselmouth",
     "Unidecode==1.4.0"
 ]
 

@@ -183,6 +183,12 @@ class TTSDatamodule(LightningDataModule):
 
     def setup(self, stage: str):
         if stage == "fit":
+            print(
+                "TTSDatamodule: "
+                f"train={path.join(self.dataset_dir, self.csv_train)} | "
+                f"val={path.join(self.dataset_dir, self.csv_val)}",
+                flush=True,
+            )
             df_train = self._read_manifest(self.csv_train)
             train_ds = self._df_to_dataset(df_train)
 

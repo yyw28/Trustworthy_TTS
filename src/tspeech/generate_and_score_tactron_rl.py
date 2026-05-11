@@ -9,7 +9,9 @@ reference wav for trust scores (same as training/validation).
 from __future__ import annotations
 
 import argparse
+import csv
 import json
+import re
 import sys
 from pathlib import Path
 from typing import Optional, TypedDict
@@ -23,15 +25,27 @@ if str(project_src) not in sys.path:
 
 import tspeech._torchvision_first  # noqa: F401
 
-import librosa
-import soundfile as sf
 import torch
-import torchaudio
-import torchaudio.functional as ta_f
 from torch.nn import functional as F
 from torch.nn.utils.rnn import pad_sequence
 
-from tspeech.data.tts.dataset import _expand_abbreviations
+try:
+    import librosa  # type: ignore
+except ModuleNotFoundError:  # pragma: no cover
+    librosa = None
+
+try:
+    import soundfile as sf  # type: ignore
+except ModuleNotFoundError:  # pragma: no cover
+    sf = None
+
+try:
+    import torchaudio  # type: ignore
+    import torchaudio.functional as ta_f  # type: ignore
+except ModuleNotFoundError:  # pragma: no cover
+    torchaudio = None
+    ta_f = None
+
 from tspeech.model.rl_gst_policy_option1 import RLGSTPolicy
 from tspeech.model.tts_rl import TTSRLModel
 
@@ -45,6 +59,37 @@ class LibriTTSRow(TypedDict, total=False):
     text: str
     duration: str
     speaker_idx: str
+
+
+_abbreviations = [
+    (re.compile("\\b%s\\." % x[0], re.IGNORECASE), x[1])
+    for x in [
+        ("mrs", "misess"),
+        ("mr", "mister"),
+        ("dr", "doctor"),
+        ("st", "saint"),
+        ("co", "company"),
+        ("jr", "junior"),
+        ("maj", "major"),
+        ("gen", "general"),
+        ("drs", "doctors"),
+        ("rev", "reverend"),
+        ("lt", "lieutenant"),
+        ("hon", "honorable"),
+        ("sgt", "sergeant"),
+        ("capt", "captain"),
+        ("esq", "esquire"),
+        ("ltd", "limited"),
+        ("col", "colonel"),
+        ("ft", "fort"),
+    ]
+]
+
+
+def _expand_abbreviations(text: str) -> str:
+    for regex, replacement in _abbreviations:
+        text = re.sub(regex, replacement, text)
+    return text
 
 
 def _normalize_text(text: str, allowed_chars: str) -> str:
@@ -137,6 +182,8 @@ def _reference_wav_to_mel_like_dataset(
     silence: int,
 ) -> tuple[torch.Tensor, int]:
     """Match ``TTSDataset`` reference mel (librosa load + trim + mel)."""
+    if librosa is None or torchaudio is None:
+        raise ModuleNotFoundError("This mode requires librosa and torchaudio.")
     wav_np, _ = librosa.load(wav_path, sr=sample_rate, mono=True)
     wav = torch.tensor(wav_np, dtype=torch.float32)
     if trim:
@@ -244,8 +291,7 @@ def _load_tts_rl_model(
             print(f"load_state_dict unexpected keys (first 10): {unexpected[:10]}")
 
     return model.to(device).eval()
-
-
+    
 def _style_from_gst_weights(
     gst_weights: torch.Tensor,
     tts_model,
@@ -313,6 +359,16 @@ def main() -> None:
     p.add_argument("--text", action="append", default=None, help="Text to synthesize (repeatable)")
     p.add_argument("--texts_file", default=None, help="Text file (one line per text)")
     p.add_argument("--output_dir", default="./tacotron_rl_test_audio")
+    p.add_argument(
+        "--no_write_audio",
+        action="store_true",
+        help="Do not write generated wav files (still computes scores in-memory).",
+    )
+    p.add_argument(
+        "--output_scores_csv",
+        default=None,
+        help="Optional path to write a pipe-delimited CSV of scores/metadata.",
+    )
     p.add_argument("--batch_size", type=int, default=8, help="Batch size for faster generation on GPU; lower if OOM")
     p.add_argument("--speaker_idx", type=int, default=0)
     p.add_argument("--end_token", default="^")
@@ -341,6 +397,28 @@ def main() -> None:
         "--no_scores",
         action="store_true",
         help="Skip *_16k.wav and scores.json (tw_classifier on generated audio)",
+    )
+    p.add_argument(
+        "--write_16k_no_scores",
+        action="store_true",
+        help="Write *_16k.wav but skip HuBERT trust scoring and scores.json.",
+    )
+    p.add_argument(
+        "--only_save_16k",
+        action="store_true",
+        help="When generating audio, only write *_16k.wav (skip original SR wav).",
+    )
+    p.add_argument(
+        "--skip_existing",
+        action="store_true",
+        help="Skip generation for utterances whose output wav already exists in --output_dir.",
+    )
+    p.add_argument(
+        "--override_tw_score",
+        type=float,
+        default=None,
+        help="Override the trust score fed into the RL policy/BERT encoder (e.g. 0.1 or 0.9). "
+        "If set, the reference-wav → vocoder → HuBERT step is skipped for computing tw_scores.",
     )
     args = p.parse_args()
 
@@ -386,6 +464,11 @@ def main() -> None:
         else torch.device(args.device)
     )
 
+    if sf is None or ta_f is None:
+        raise ModuleNotFoundError(
+            "This mode requires soundfile and torchaudio."
+        )
+
     model = _load_tts_rl_model(
         args.checkpoint,
         device,
@@ -417,6 +500,22 @@ def main() -> None:
         )
 
     scores: list[dict] = []
+    scores_writer = None
+    scores_fh = None
+    if args.output_scores_csv:
+        out_csv = Path(args.output_scores_csv)
+        out_csv.parent.mkdir(parents=True, exist_ok=True)
+        scores_fh = out_csv.open("w", newline="")
+        fieldnames = [
+            "row_index",
+            "ref_wav",
+            "wav_path_orig",
+            "wav_path_16k",
+            "generated_trustworthiness_score",
+            "gst_weights",
+        ]
+        scores_writer = csv.DictWriter(scores_fh, fieldnames=fieldnames, delimiter="|")
+        scores_writer.writeheader()
     bs = max(1, int(args.batch_size))
     ref_sr = int(args.reference_sample_rate)
     sr_vocoder = HIFI_GAN_SR
@@ -434,6 +533,8 @@ def main() -> None:
             end = min(start + bs, len(transcripts))
             batch_transcripts = transcripts[start:end]
             bsz = end - start
+            if start == 0 or (start // bs) % 25 == 0:
+                print(f"Progress: {start}/{len(transcripts)}", flush=True)
 
             if rows:
                 ref_mel, ref_mel_len = _batch_reference_mels(
@@ -463,15 +564,23 @@ def main() -> None:
                 ref_mel = mel0.unsqueeze(0).expand(bsz, -1, -1).contiguous()
                 ref_mel_len = torch.full((bsz,), ln0, dtype=torch.int64, device=device)
 
-            # Reference mels use --reference_sample_rate (match RL datamodule); same as training_step
-            # ``wav_lens = mel_len * 256`` when mels are already HiFi-GAN–compatible.
-            wav_ref = model.vocoder(ref_mel)
-            seq_len = wav_ref.shape[1]
-            wav_lens = ref_mel_len * 256
-            time = torch.arange(seq_len, device=device)[None, :]
-            mask = (time < wav_lens[:, None]).long()
+            if args.override_tw_score is None:
+                # Reference mels use --reference_sample_rate (match RL datamodule); same as training_step
+                # ``wav_lens = mel_len * 256`` when mels are already HiFi-GAN–compatible.
+                wav_ref = model.vocoder(ref_mel)
+                seq_len = wav_ref.shape[1]
+                wav_lens = ref_mel_len * 256
+                time = torch.arange(seq_len, device=device)[None, :]
+                mask = (time < wav_lens[:, None]).long()
 
-            tw_scores = torch.sigmoid(model.tw_classifier(wav=wav_ref, mask=mask)).squeeze(-1)
+                tw_scores = torch.sigmoid(model.tw_classifier(wav=wav_ref, mask=mask)).squeeze(-1)
+            else:
+                tw_scores = torch.full(
+                    (bsz,),
+                    float(args.override_tw_score),
+                    device=device,
+                    dtype=torch.float32,
+                )
 
             bert_embeddings = model.bert_gst_encoder(score=tw_scores, text=batch_transcripts)
             gst_weights = _rl_gst_weights_deterministic(model.rl_policy, bert_embeddings)
@@ -531,11 +640,28 @@ def main() -> None:
             for bi, j in enumerate(range(start, end)):
                 out_name = _out_name(j)
                 out_path = out_dir / out_name
+                out_name_16k = (
+                    out_name[:-4] + "_16k.wav"
+                    if out_name.lower().endswith(".wav")
+                    else out_name + "_16k.wav"
+                )
+                out_path_16k = out_dir / out_name_16k
+                if args.skip_existing:
+                    if args.only_save_16k:
+                        if out_path_16k.is_file():
+                            continue
+                    else:
+                        if out_path.is_file() or out_path_16k.is_file():
+                            continue
                 n = int(pred_len[bi].item())
                 wav_0 = wav[bi, :n].detach().cpu().numpy()
-                sf.write(str(out_path), wav_0, sr_vocoder)
+                if not args.no_write_audio and not args.only_save_16k:
+                    sf.write(str(out_path), wav_0, sr_vocoder)
 
-                if not args.no_scores:
+                # 16 kHz HuBERT-rate output is needed both for trust scoring and for
+                # users who only want *_16k.wav artifacts.
+                write_16k = (not args.no_scores) or args.write_16k_no_scores or args.only_save_16k
+                if write_16k:
                     seg = wav[bi : bi + 1, :n]
                     wav16_seg = ta_f.resample(
                         seg,
@@ -543,15 +669,19 @@ def main() -> None:
                         new_freq=HUBERT_SR,
                     )
                     wav16_0 = wav16_seg.squeeze(0)
-                    out_name_16k = (
-                        out_name[:-4] + "_16k.wav"
-                        if out_name.lower().endswith(".wav")
-                        else out_name + "_16k.wav"
-                    )
-                    out_path_16k = out_dir / out_name_16k
-                    sf.write(str(out_path_16k), wav16_0.detach().cpu().numpy(), HUBERT_SR)
+                    if not args.no_write_audio:
+                        sf.write(str(out_path_16k), wav16_0.detach().cpu().numpy(), HUBERT_SR)
 
-                    mask_s = torch.ones((1, wav16_0.shape[0]), device=device, dtype=torch.long)
+                if not args.no_scores:
+                    # HuBERT's conv frontend requires a minimum input length; extremely short
+                    # generations can otherwise crash scoring. Pad with masked zeros.
+                    orig_len = int(wav16_0.shape[0])
+                    min_hubert_len = 3200  # 0.2s @ 16kHz; safe for HuBERT feature extractor
+                    if orig_len < min_hubert_len:
+                        wav16_0 = F.pad(wav16_0, (0, min_hubert_len - orig_len))
+                    mask_s = torch.ones((1, int(wav16_0.shape[0])), device=device, dtype=torch.long)
+                    if orig_len < int(wav16_0.shape[0]):
+                        mask_s[0, orig_len:] = 0
                     score = torch.sigmoid(
                         model.tw_classifier(wav=wav16_0.unsqueeze(0), mask=mask_s)
                     ).squeeze(-1)[0].item()
@@ -559,19 +689,38 @@ def main() -> None:
                     H = model.rl_policy.gst_heads
                     Tn = model.rl_policy.gst_token_num
                     gst_w_per_head = gst_weights.view(bsz, H, Tn)[bi].detach().cpu().tolist()
+                    ref_wav = None
+                    if rows and j < len(rows) and rows[j].get("wav"):
+                        ref_wav = str(rows[j]["wav"])
                     scores.append(
                         {
-                            "wav_path_orig": str(out_path),
+                            "row_index": int(j),
+                            "ref_wav": ref_wav,
+                            "wav_path_orig": (None if args.only_save_16k else str(out_path)),
                             "wav_path_16k": str(out_path_16k),
                             "generated_trustworthiness_score": float(score),
                             "gst_weights": gst_w_per_head,
                         }
                     )
+                    if scores_writer is not None:
+                        rr = {
+                            "row_index": int(j),
+                            "ref_wav": ref_wav,
+                            "wav_path_orig": (None if args.only_save_16k else str(out_path)),
+                            "wav_path_16k": str(out_path_16k),
+                            "generated_trustworthiness_score": float(score),
+                            "gst_weights": json.dumps(gst_w_per_head),
+                        }
+                        scores_writer.writerow(rr)
 
     if scores:
         scores_path = out_dir / "scores.json"
         scores_path.write_text(json.dumps(scores, indent=2))
         print(f"Saved scores to {scores_path}")
+        if args.output_scores_csv:
+            print(f"Saved scores CSV to {args.output_scores_csv}")
+    if scores_fh is not None:
+        scores_fh.close()
 
     print(f"Saved {len(transcripts)} wavs to {out_dir}")
 

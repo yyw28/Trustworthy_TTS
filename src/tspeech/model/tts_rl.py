@@ -1,5 +1,6 @@
+import inspect
 from pathlib import Path
-from typing import Final, Optional
+from typing import Final, Optional, Tuple
 
 import tspeech._torchvision_first  # noqa: F401
 
@@ -23,6 +24,26 @@ HUBERT_SAMPLE_RATE: Final[int] = 16000
 _DEFAULT_TACOTRON_SAMPLE_RATE: Final[int] = 16000
 
 
+def _compute_rl_reward_and_advantage(
+    tw_scores: Tensor, tw_scores_pred: Tensor
+) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+    """
+    REINFORCE reward from per-utterance trust scores (reference vs generated).
+
+    ``tw_scores`` is from teacher audio; ``tw_scores_pred`` from synthesized audio.
+    """
+    abs_diff = (tw_scores - tw_scores_pred).abs()
+    score_correct = 1 - abs_diff
+    # Active reward (keep in sync with experiments; alternatives below are inactive):
+    # reward = score_correct.mean()  # would need broadcast for per-sample REINFORCE
+    reward = - abs_diff
+    #reward = torch.exp(-abs_diff / 0.1)
+    # reward = (abs_diff < 0.1).float() * 2 - 1
+    #reward = torch.where(abs_diff < 0.1, torch.ones_like(abs_diff), -torch.ones_like(abs_diff))
+    advantage = (reward - reward.mean()) / (reward.std() + 1e-8)
+    return reward, advantage, abs_diff, score_correct
+
+
 class TTSRLModel(pl.LightningModule):
     def __init__(
         self,
@@ -31,8 +52,8 @@ class TTSRLModel(pl.LightningModule):
         hubert_checkpoint_path: Optional[str] = None,
         bert_model_name: str = "bert-base-uncased",
         hubert_model_name: str = "facebook/hubert-base-ls960",
-        rl_temperature: float = 1,
-        rl_entropy_coef: float = 0.005,
+        rl_temperature: float = 1.0,
+        rl_entropy_coef: float = 0.005, #.0001,
         save_audio_dir: Optional[str] = None,
         save_audio_every_n_steps: int = 100,
         tacotron_config_path: Optional[str] = None,
@@ -107,14 +128,36 @@ class TTSRLModel(pl.LightningModule):
         for p in self.tts.parameters():
             p.requires_grad = False
         self.tts.eval()
-        
+
+    def on_train_start(self) -> None:
+        # Use plain stdout so the value is visible even if logging filters INFO.
+        if int(getattr(self, "global_rank", 0)) == 0:
+            # Best-effort seed reporting: Lightning sets this when using seed_everything(...).
+            seed = None
+            try:
+                seed = int(getattr(self.trainer, "seed", None))  # type: ignore[attr-defined]
+            except Exception:
+                seed = None
+            if seed is None:
+                try:
+                    seed = int(getattr(pl, "seed_everything", lambda: None)())  # type: ignore[misc]
+                except Exception:
+                    seed = None
+
+            print(
+                f"RLGSTPolicy clamp: log_std in [{self.rl_policy.log_std_min}, {self.rl_policy.log_std_max}], "
+                f"temperature={self.rl_policy.temperature} | "
+                f"rl_entropy_coef={self.rl_entropy_coef} | seed={seed}",
+                flush=True,
+            )
+            print("RL reward / advantage (source used in training_step):", flush=True)
+            print(inspect.getsource(_compute_rl_reward_and_advantage), flush=True)
 
     def _save_audio_if_needed(
         self,
         waveforms: Tensor,
         batch_idx: int,
         length_samples: Optional[Tensor] = None,
-        *,
         sample_rate: Optional[int] = None,
         filename_suffix: str = "",
     ) -> None:
@@ -385,18 +428,14 @@ class TTSRLModel(pl.LightningModule):
         mel_post_loss = F.mse_loss(mel_spectrogram_post, batch.mel_spectrogram, reduction="none").mean(dim=(1, 2))
         tts_loss = gate_loss + mel_loss + mel_post_loss  # (batch_size,)
         
-        abs_diff = (tw_scores - tw_scores_pred).abs()  # (batch_size,)
-        score_correct = 1-abs_diff #(abs_diff < 0.1).float()
-
-        #reward = score_correct.mean()
-        #reward = -(abs_diff) #- tts_loss.detach() #torch.exp(-abs_diff / 0.1)
-        reward = (abs_diff < 0.1).float() * 2 - 1
-        advantage = (reward - reward.mean()) / (reward.std() + 1e-8)
+        reward, advantage, abs_diff, score_correct = _compute_rl_reward_and_advantage(
+            tw_scores, tw_scores_pred
+        )
         log_prob_per_sample = log_probs.reshape(batch_size, -1).sum(dim=1)  # (batch_size,)
-        reinforce_loss = -(log_prob_per_sample * reward.detach()).mean()
-
+        reinforce_loss = -(log_prob_per_sample * advantage.detach()).mean()
+        
         gst_entropy = -(gst_weights * torch.log(gst_weights.clamp_min(1e-8))).sum(dim=1)
-        gst_entropy_per_sample = gst_entropy.view(batch_size, self.rl_policy.gst_heads).mean(dim=1)
+        gst_entropy_per_sample = gst_entropy.view(batch_size, self.rl_policy.gst_heads).sum(dim=1)
         entropy_bonus = gst_entropy_per_sample.mean()
 
         loss = reinforce_loss - self.rl_entropy_coef * entropy_bonus
