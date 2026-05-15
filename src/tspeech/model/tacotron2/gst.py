@@ -1,5 +1,7 @@
+from typing import Optional
+
 import torch
-from torch import nn
+from torch import Tensor, nn
 from torch.nn import functional as F
 
 # Currently based on the Nvidia Mellotron GST code
@@ -42,7 +44,7 @@ class ReferenceEncoder(nn.Module):
         self.n_mel_channels = n_mel_channels
         self.ref_enc_gru_size = ref_enc_gru_size
 
-    def forward(self, inputs, input_lengths=None):
+    def forward(self, inputs, input_lengths: Optional[Tensor] = None):
         out = inputs.view(inputs.size(0), 1, -1, self.n_mel_channels)
         for conv, bn in zip(self.convs, self.bns):
             out = conv(out)
@@ -55,9 +57,8 @@ class ReferenceEncoder(nn.Module):
 
         if input_lengths is not None:
             input_lengths = torch.ceil(input_lengths.float() / 2 ** len(self.convs))
-            input_lengths = input_lengths.cpu().numpy().astype(int)
             out = nn.utils.rnn.pack_padded_sequence(
-                out, input_lengths, batch_first=True, enforce_sorted=False
+                out, input_lengths.cpu(), batch_first=True, enforce_sorted=False
             )
 
         self.gru.flatten_parameters()
@@ -75,7 +76,13 @@ class STL(nn.Module):
     inputs --- [N, token_embedding_size//2]
     """
 
-    def __init__(self, token_num, token_embedding_size, num_heads, ref_enc_gru_size):
+    def __init__(
+        self,
+        token_num: int,
+        token_embedding_size: int,
+        num_heads: int,
+        ref_enc_gru_size: int,
+    ):
         super().__init__()
         self.embed = nn.Parameter(
             torch.FloatTensor(token_num, token_embedding_size // num_heads)
@@ -95,10 +102,9 @@ class STL(nn.Module):
             batch_first=True,
         )
 
-        # REVISED CODE - std was 0.25 (this was not original - 0.5 is in the original implementation)
         nn.init.normal_(self.embed, mean=0, std=0.5)
 
-    def forward(self, inputs):
+    def forward(self, inputs: Tensor) -> Tensor:
         N = inputs.size(0)
         query = inputs.unsqueeze(1)
         keys = (
@@ -116,14 +122,14 @@ class STL(nn.Module):
 
 
 class GST(nn.Module):
-    def __init__(self, out_dim:int):
+    def __init__(self, out_dim: int):
         super().__init__()
         self.reference_encoder = ReferenceEncoder(
             ref_enc_filters=[32, 32, 64, 64, 128, 128],
             n_mel_channels=80,
             ref_enc_gru_size=128,
         )
-        self.stl = STL(
+        self.stl: nn.Module = STL(
             token_num=10,
             token_embedding_size=out_dim,
             num_heads=8,
