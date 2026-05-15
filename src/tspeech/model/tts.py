@@ -16,6 +16,10 @@ from torch.nn import functional as F
 from tspeech.data.tts import TTSBatch
 from tspeech.model.tacotron2 import Tacotron2
 from tspeech.model.tacotron2 import GST
+from tspeech.model.bert_gst_encoder import BERTEncoder
+from tspeech.model.rl_gst_policy_option1 import RLGSTPolicy
+from tspeech.model.htmodel import HTModel
+from tspeech.vocoder import HiFiGANVocoder
 
 
 class TTSModel(pl.LightningModule):
@@ -39,8 +43,11 @@ class TTSModel(pl.LightningModule):
     ):
         super().__init__()
 
+        self.strict_loading = False
+
         self.save_hyperparameters()
 
+        self.encoded_dim = encoded_dim
         self.speaker_tokens = speaker_tokens_enabled
         self.max_len_override = max_len_override
 
@@ -79,14 +86,8 @@ class TTSModel(pl.LightningModule):
         mel_spectrogram_len: Optional[Tensor] = None,
         speaker_id: Optional[Tensor] = None,
         max_len_override: Optional[int] = None,
-        mel_spectrogram_style: Optional[Tensor] = None,
-        mel_spectrogram_style_len: Optional[Tensor] = None,
+        style: Optional[Tensor] = None,
     ):
-        style: Tensor | None = None
-
-        if self.gst is not None:
-            style = self.gst(mel_spectrogram_style, mel_spectrogram_style_len)
-
         return self.tacotron2(
             chars_idx=chars_idx,
             chars_idx_len=chars_idx_len,
@@ -100,6 +101,12 @@ class TTSModel(pl.LightningModule):
         )
 
     def validation_step(self, batch: TTSBatch, batch_idx):
+        style: Tensor | None = (
+            self.gst(batch.mel_spectrogram, batch.mel_spectrogram_len)
+            if self.gst_enabled and self.gst is not None
+            else None
+        )
+
         mel_spectrogram, mel_spectrogram_post, gate, alignment = self(
             chars_idx=batch.chars_idx,
             chars_idx_len=batch.chars_idx_len,
@@ -108,8 +115,7 @@ class TTSModel(pl.LightningModule):
             speaker_id=batch.speaker_id,
             mel_spectrogram=batch.mel_spectrogram,
             mel_spectrogram_len=batch.mel_spectrogram_len,
-            mel_spectrogram_style=batch.mel_spectrogram,
-            mel_spectrogram_style_len=batch.mel_spectrogram_len,
+            style=style,
         )
 
         gate_loss = F.binary_cross_entropy_with_logits(gate, batch.gate)
@@ -152,8 +158,14 @@ class TTSModel(pl.LightningModule):
         out["loss"] = loss
         return out
 
-    def training_step(self, batch, batch_idx):
-        mel_spectrogram, mel_spectrogram_post, gate, alignment = self(
+    def training_step(self, batch, batch_idx: int) -> Tensor:
+        style: Tensor | None = (
+            self.gst(batch.mel_spectrogram, batch.mel_spectrogram_len)
+            if self.gst_enabled and self.gst is not None
+            else None
+        )
+
+        mel_spectrogram, mel_spectrogram_post, gate, _ = self(
             chars_idx=batch.chars_idx,
             chars_idx_len=batch.chars_idx_len,
             teacher_forcing=True,
@@ -161,8 +173,7 @@ class TTSModel(pl.LightningModule):
             speaker_id=batch.speaker_id,
             mel_spectrogram=batch.mel_spectrogram,
             mel_spectrogram_len=batch.mel_spectrogram_len,
-            mel_spectrogram_style=batch.mel_spectrogram,
-            mel_spectrogram_style_len=batch.mel_spectrogram_len,
+            style=style,
         )
 
         gate_loss = F.binary_cross_entropy_with_logits(gate, batch.gate)
@@ -256,9 +267,31 @@ class TTSModel(pl.LightningModule):
             max_len_override=self.max_len_override,
             mel_spectrogram_style=batch.mel_spectrogram,
             mel_spectrogram_style_len=batch.mel_spectrogram_len,
+            text=text,
         )
 
         return mel_spectrogram, mel_spectrogram_post, gate, alignment, text
+
+    # === RL helpers (ported from rl_gst_tts) =====================================================
+
+    def _save_audio_if_needed(self, waveforms: Tensor, batch_idx: int):
+        if not (self.save_audio_dir and batch_idx % self.save_audio_every_n_steps == 0):
+            return
+        import soundfile as sf
+        from pathlib import Path
+        import numpy as np
+
+        for i in range(waveforms.shape[0]):
+            w = waveforms[i].detach().cpu().numpy()
+            w = w / (np.abs(w).max() + 1e-8)
+            sf.write(
+                str(
+                    Path(self.save_audio_dir)
+                    / f"epoch_{self.current_epoch}_step_{batch_idx}_sample_{i}.wav"
+                ),
+                w,
+                22050,
+            )
 
 
 def plot_spectrogram_to_numpy(spectrogram) -> Figure:

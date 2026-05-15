@@ -1,3 +1,5 @@
+import tspeech._torchvision_first  # noqa: F401
+
 from lightning.pytorch.cli import LightningCLI
 import torch
 

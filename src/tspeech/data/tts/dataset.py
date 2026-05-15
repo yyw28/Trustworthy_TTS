@@ -9,7 +9,6 @@ from torch import Tensor
 from torch.nn import functional as F
 from torch.utils.data import Dataset
 from torchaudio.transforms import MelSpectrogram
-from torchcodec.decoders import AudioDecoder
 
 
 class TTSBatch(NamedTuple):
@@ -154,6 +153,29 @@ class TTSDataset(Dataset):
             center=True,
         )
 
+    def _load_audio(self, file_path: str) -> Tensor:
+        # Prefer torchcodec when available (fast). If it fails to load (e.g. FFmpeg or
+        # version mismatch), fall back to librosa, which does not depend on torchcodec.
+        try:
+            from torchcodec.decoders import AudioDecoder  # type: ignore
+
+            with open(file_path, "rb") as infile:
+                decoder = AudioDecoder(infile.read(), sample_rate=self.sample_rate)
+                wav = decoder.get_all_samples().data
+
+            # Ensure mono 1D float tensor
+            if wav.ndim == 2 and wav.shape[0] > 1:
+                wav = wav.mean(dim=0, keepdim=True)
+            wav = wav.squeeze(0).to(dtype=torch.float32)
+            return wav
+        except Exception:
+            pass
+
+        # Fallback: decode with librosa (no torchcodec usage)
+        wav_np, _ = librosa.load(file_path, sr=self.sample_rate, mono=True)
+        wav = torch.tensor(wav_np, dtype=torch.float32)
+        return wav
+
     def __len__(self):
         return len(self.filenames)
 
@@ -161,11 +183,7 @@ class TTSDataset(Dataset):
         # Audio preprocessing -----------------------------------------------------------
         # Load the audio file and squeeze it to a 1D Tensor
         filename = self.filenames[i]
-
-        with open(path.join(self.base_dir, filename), "rb") as infile:
-            decoder = AudioDecoder(infile.read(), sample_rate=self.sample_rate)
-            wav = decoder.get_all_samples().data
-        wav = wav.squeeze(0)
+        wav = self._load_audio(path.join(self.base_dir, filename))
 
         # Trim if necessary
         if self.trim:

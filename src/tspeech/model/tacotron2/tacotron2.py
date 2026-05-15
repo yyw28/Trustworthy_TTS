@@ -33,7 +33,19 @@ class Tacotron2(nn.Module):
 
         speaker_token_dim = encoded_dim
 
-        self.encoded_full_dim: int = encoded_dim + extra_encoded_dim
+        self.film: nn.Module | None = None
+        self.film_h: nn.Module | None = None
+        self.film_g: nn.Module | None = None
+        if extra_encoded_dim > 0 or speaker_tokens_enabled:
+            film_in = extra_encoded_dim
+            if speaker_tokens_enabled:
+                film_in += speaker_token_dim
+
+            self.film = nn.Sequential(nn.Linear(film_in, film_in), nn.ReLU())
+            self.film_h = nn.Linear(film_in, encoded_dim)
+            self.film_g = nn.Linear(film_in, encoded_dim)
+
+        self.encoded_full_dim: int = encoded_dim  # + extra_encoded_dim
 
         self.speaker_embeddings_enabled: Final[bool] = speaker_tokens_enabled
         if speaker_tokens_enabled:
@@ -47,9 +59,9 @@ class Tacotron2(nn.Module):
             print("Speaker tokens disabled")
 
         if speaker_tokens_enabled and speaker_count is not None:
-            self.encoded_full_dim += speaker_token_dim // 2
+            # self.encoded_full_dim += speaker_token_dim // 2
             self.speaker_embedding = nn.Embedding(
-                num_embeddings=speaker_count, embedding_dim=speaker_token_dim // 2
+                num_embeddings=speaker_count, embedding_dim=speaker_token_dim  # // 2
             )
             self.speaker_embedding.weight.data.normal_(mean=0, std=0.5)
 
@@ -150,18 +162,25 @@ class Tacotron2(nn.Module):
 
         # Encoding --------------------------------------------------------------------------------
         encoded = self.encoder(chars_idx, chars_idx_len)
-        encoded_extra_arr = []
+        film_in = []
         if self.speaker_embeddings_enabled:
-            encoded_extra_arr.append(
+            film_in.append(
                 torch.tanh(self.speaker_embedding(speaker_id))
                 .unsqueeze(1)
                 .expand((-1, encoded.shape[1], -1)),
             )
         if encoded_extra is not None:
-            encoded_extra_arr.append(encoded_extra.expand((-1, encoded.shape[1], -1)))
+            film_in.append(encoded_extra.expand((-1, encoded.shape[1], -1)))
 
-        if len(encoded_extra_arr) > 0:
-            encoded = torch.concat([encoded] + encoded_extra_arr, -1)
+        if (
+            len(film_in) > 0
+            and self.film is not None
+            and self.film_g is not None
+            and self.film_h is not None
+        ):
+            film = self.film(torch.concat(film_in, -1))
+            encoded = (encoded * self.film_h(film)) + self.film_g(film)
+            # encoded = torch.concat([encoded] + film_in, -1)
 
         # Create a mask for the encoded characters
         encoded_mask = (
